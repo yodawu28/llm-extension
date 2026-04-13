@@ -51,7 +51,8 @@ class TokenCounter:
         self,
         chunks_with_scores: List[tuple[Chunk, float]],
         reserve_tokens: int = 4096,
-        max_chunks_per_page: int = 3
+        max_chunks_per_page: int = 3,
+        page_chunk_caps: dict[str, int] | None = None
     ) -> List[Chunk]:
         """
         Select chunks that fit within token budget
@@ -82,6 +83,7 @@ class TokenCounter:
         for chunk, score in sorted_chunks:
             chunk_tokens = self.count_text(chunk.text)
             page_url = chunk.metadata.page_url
+            page_cap = max(1, page_chunk_caps.get(page_url, max_chunks_per_page)) if page_chunk_caps else max_chunks_per_page
 
             # Always include first chunk (most relevant)
             if len(selected_chunks) == 0:
@@ -105,7 +107,9 @@ class TokenCounter:
         for chunk, score in deferred_chunks:
             page_url = chunk.metadata.page_url
 
-            if page_chunk_counts.get(page_url, 0) >= max_chunks_per_page:
+            page_cap = max(1, page_chunk_caps.get(page_url, max_chunks_per_page)) if page_chunk_caps else max_chunks_per_page
+
+            if page_chunk_counts.get(page_url, 0) >= page_cap:
                 continue
 
             chunk_tokens = self.count_text(chunk.text)

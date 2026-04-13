@@ -282,6 +282,44 @@ function titlesLikelyMatch(sourceTitle: string, currentTitle: string) {
   return overlapCount >= Math.max(2, Math.ceil(Math.min(sourceTokens.size, currentTokens.length) / 2))
 }
 
+function getSeverityRank(severity: CritiqueIssue["severity"]) {
+  if (severity === "high") return 3
+  if (severity === "medium") return 2
+  return 1
+}
+
+function selectCritiqueIssuesForCurrentPage(
+  issues: CritiqueIssue[],
+  currentPageTitle: string
+): CritiqueIssue[] {
+  const issuesForCurrentPage = issues.filter((issue) => {
+    if (!issue.source_title) {
+      return true
+    }
+
+    return titlesLikelyMatch(issue.source_title, currentPageTitle)
+  })
+
+  const relevantIssues = issuesForCurrentPage.length > 0 ? issuesForCurrentPage : issues
+
+  return [...relevantIssues].sort((left, right) => {
+    const severityDelta = getSeverityRank(right.severity) - getSeverityRank(left.severity)
+
+    if (severityDelta !== 0) {
+      return severityDelta
+    }
+
+    const leftHasSourceMatch = left.source_title ? titlesLikelyMatch(left.source_title, currentPageTitle) : false
+    const rightHasSourceMatch = right.source_title ? titlesLikelyMatch(right.source_title, currentPageTitle) : false
+
+    if (leftHasSourceMatch !== rightHasSourceMatch) {
+      return rightHasSourceMatch ? 1 : -1
+    }
+
+    return left.title.localeCompare(right.title)
+  })
+}
+
 function filterSuggestionsForPinnedPages(
   suggestions: ChatMessage["suggestions"],
   pinnedPages: ContextPage[]
@@ -335,6 +373,48 @@ function buildRagDiagnostics(response: SummarizeResponse): ChatMessage["diagnost
     })
   }
 
+  if (usage.retrieval_mode) {
+    items.push({
+      label: "Routing mode",
+      value: usage.retrieval_mode
+    })
+  }
+
+  if (usage.retrieval_strategy) {
+    items.push({
+      label: "Retrieval",
+      value: usage.retrieval_strategy
+    })
+  }
+
+  if (typeof usage.high_priority_pages === "number") {
+    items.push({
+      label: "High-priority pages",
+      value: String(usage.high_priority_pages)
+    })
+  }
+
+  if (typeof usage.deduped_pages === "number") {
+    items.push({
+      label: "Deduped pages",
+      value: String(usage.deduped_pages)
+    })
+  }
+
+  if (typeof usage.context_budget_tokens === "number") {
+    items.push({
+      label: "Context budget",
+      value: usage.context_budget_tokens.toLocaleString()
+    })
+  }
+
+  if (usage.embedding_fallback_used) {
+    items.push({
+      label: "Embedding fallback",
+      value: usage.embedding_provider_forbidden ? "provider forbidden" : "used"
+    })
+  }
+
   if (usage.cost_estimate) {
     items.push({
       label: "Cost",
@@ -384,6 +464,48 @@ function buildDiagramDiagnostics(response: DiagramResponse): ChatMessage["diagno
     items.push({
       label: "Reranked candidates",
       value: String(usage.reranker_candidates)
+    })
+  }
+
+  if (usage.retrieval_mode) {
+    items.push({
+      label: "Routing mode",
+      value: usage.retrieval_mode
+    })
+  }
+
+  if (usage.retrieval_strategy) {
+    items.push({
+      label: "Retrieval",
+      value: usage.retrieval_strategy
+    })
+  }
+
+  if (typeof usage.high_priority_pages === "number") {
+    items.push({
+      label: "High-priority pages",
+      value: String(usage.high_priority_pages)
+    })
+  }
+
+  if (typeof usage.deduped_pages === "number") {
+    items.push({
+      label: "Deduped pages",
+      value: String(usage.deduped_pages)
+    })
+  }
+
+  if (typeof usage.context_budget_tokens === "number") {
+    items.push({
+      label: "Context budget",
+      value: usage.context_budget_tokens.toLocaleString()
+    })
+  }
+
+  if (usage.embedding_fallback_used) {
+    items.push({
+      label: "Embedding fallback",
+      value: usage.embedding_provider_forbidden ? "provider forbidden" : "used"
     })
   }
 
@@ -497,6 +619,48 @@ function buildCritiqueDiagnostics(response: CritiqueResponse): ChatMessage["diag
     items.push({
       label: "Cost",
       value: `$${usage.cost_estimate.total_cost.toFixed(4)}`
+    })
+  }
+
+  if (usage.retrieval_mode) {
+    items.push({
+      label: "Routing mode",
+      value: usage.retrieval_mode
+    })
+  }
+
+  if (usage.retrieval_strategy) {
+    items.push({
+      label: "Retrieval",
+      value: usage.retrieval_strategy
+    })
+  }
+
+  if (typeof usage.high_priority_pages === "number") {
+    items.push({
+      label: "High-priority pages",
+      value: String(usage.high_priority_pages)
+    })
+  }
+
+  if (typeof usage.deduped_pages === "number") {
+    items.push({
+      label: "Deduped pages",
+      value: String(usage.deduped_pages)
+    })
+  }
+
+  if (typeof usage.context_budget_tokens === "number") {
+    items.push({
+      label: "Context budget",
+      value: usage.context_budget_tokens.toLocaleString()
+    })
+  }
+
+  if (usage.embedding_fallback_used) {
+    items.push({
+      label: "Embedding fallback",
+      value: usage.embedding_provider_forbidden ? "provider forbidden" : "used"
     })
   }
 
@@ -794,28 +958,28 @@ function SidePanel() {
     await savePinnedPages(updated)
   }
 
-  async function highlightCritiqueOnPage(message: ChatMessage) {
+  async function highlightCritiqueOnPage(
+    message: ChatMessage,
+    options?: {
+      auto?: boolean
+    }
+  ) {
     if (!currentPage?.tabId || !message.critiqueIssues?.length) {
-      showBannerToast({
-        title: "No page available",
-        message: "Open the source page in Chrome, then run highlight again.",
-        tone: "info"
-      })
+      if (!options?.auto) {
+        showBannerToast({
+          title: "No page available",
+          message: "Open the source page in Chrome, then run highlight again.",
+          tone: "info"
+        })
+      }
       return
     }
 
     setHighlightingCritiqueId(message.id)
 
     try {
-      const issuesForCurrentPage = message.critiqueIssues.filter((issue) => {
-        if (!issue.source_title) {
-          return true
-        }
-
-        return titlesLikelyMatch(issue.source_title, currentPage.title)
-      })
-      const issuesToHighlight =
-        issuesForCurrentPage.length > 0 ? issuesForCurrentPage : message.critiqueIssues
+      const rankedIssues = selectCritiqueIssuesForCurrentPage(message.critiqueIssues, currentPage.title)
+      const issuesToHighlight = options?.auto ? rankedIssues.slice(0, 1) : rankedIssues
 
       const response = await chrome.tabs.sendMessage(currentPage.tabId, {
         action: "ghost-critic-highlight",
@@ -831,27 +995,37 @@ function SidePanel() {
       const matchedIssues = Number(response.matchedIssues || 0)
       const totalIssues = Number(response.totalIssues || issuesToHighlight.length)
 
-      showBannerToast(
-        matchedIssues > 0
-          ? {
-              title: "Ghost Critic highlighted this page",
-              message: `Matched ${matchedIssues} of ${totalIssues} finding${totalIssues > 1 ? "s" : ""} on the current tab.`,
-              tone: "success"
-            }
-          : {
-              title: "No matching text found",
-              message: "Open the source page that contains the cited evidence, then try highlight again.",
-              tone: "info"
-            },
-        matchedIssues > 0 ? 4000 : 5000
-      )
+      if (matchedIssues > 0) {
+        showBannerToast(
+          options?.auto
+            ? {
+                title: "Ghost Critic auto-highlighted the top finding",
+                message: `Highlighted the strongest matching issue on the current tab.`,
+                tone: "success"
+              }
+            : {
+                title: "Ghost Critic highlighted this page",
+                message: `Matched ${matchedIssues} of ${totalIssues} finding${totalIssues > 1 ? "s" : ""} on the current tab.`,
+                tone: "success"
+              },
+          4000
+        )
+      } else if (!options?.auto) {
+        showBannerToast({
+          title: "No matching text found",
+          message: "Open the source page that contains the cited evidence, then try highlight again.",
+          tone: "info"
+        }, 5000)
+      }
     } catch (error) {
       console.error("Error highlighting critique findings:", error)
-      showBannerToast({
-        title: "Could not highlight current page",
-        message: "Refresh the tab once and try again. Chrome may not allow content scripts on this page.",
-        tone: "info"
-      }, 5000)
+      if (!options?.auto) {
+        showBannerToast({
+          title: "Could not highlight current page",
+          message: "Refresh the tab once and try again. Chrome may not allow content scripts on this page.",
+          tone: "info"
+        }, 5000)
+      }
     } finally {
       setHighlightingCritiqueId(null)
     }
@@ -1170,6 +1344,11 @@ function SidePanel() {
 
           setProcessingStage("✍️ Streaming review...")
           await presentAssistantMessage(assistantMessage)
+
+          if (currentPage) {
+            setProcessingStage("🎯 Auto-highlighting top finding...")
+            await highlightCritiqueOnPage(assistantMessage, { auto: true })
+          }
         } else {
           const response = await apiClient.ragSummarize({
             pages: pagesWithMarkdown,
@@ -1209,11 +1388,15 @@ function SidePanel() {
           error.status === 0 || error.message?.includes("fetch")
             ? "**Possible causes:**\n• Backend server is not running\n• Backend is not accessible at http://localhost:8000\n\n**To fix:**\n1. Start backend: `cd backend && source venv/bin/activate && uvicorn main:app --reload`\n2. Check backend is running at http://localhost:8000/api/health"
             : error.status === 408 || error.message?.toLowerCase?.().includes("timed out")
-              ? "**Possible causes:**\n• Backend request is hanging on embeddings or LLM call\n• API provider is slow or unreachable\n\n**To fix:**\n1. Check backend terminal logs\n2. Verify `backend/.env` has a valid API key\n3. Try a smaller set of pinned pages and retry"
+              ? "**Possible causes:**\n• Backend request is hanging on embeddings or LLM call\n• API provider is slow or unreachable\n\n**To fix:**\n1. Check backend terminal logs\n2. Verify `backend/.env` has valid provider credentials (`OPENAI_API_KEY` or `PAT_TOKEN + AWS_GATEWAY_URL`)\n3. Try a smaller set of pinned pages and retry"
             : error.status === 400
               ? "**Possible causes:**\n• Input too large (exceeded token limit)\n• Invalid request format"
+              : (error.detail || error.message || "").toLowerCase().includes("gateway forbids the chat model")
+                ? "**Possible causes:**\n• `OPENAI_MODEL` is not on the gateway allow-list\n• The PAT has access to the gateway but not to this chat provider/model\n\n**To fix:**\n1. Check `backend/.env` for `OPENAI_MODEL`\n2. Switch to a model explicitly allowed by the gateway\n3. Restart backend after updating `.env`"
+              : (error.detail || error.message || "").toLowerCase().includes("selected provider is forbidden")
+                ? "**Possible causes:**\n• `PAT_TOKEN` is valid but the selected model/provider is blocked by the gateway\n• The gateway allows chat but denies embeddings for the configured model/provider\n\n**To fix:**\n1. Check `backend/.env` has the correct `PAT_TOKEN` and `AWS_GATEWAY_URL`\n2. Verify the configured `OPENAI_MODEL` and `OPENAI_EMBEDDING_MODEL` are allowed by the gateway\n3. Check backend logs to see whether the failure came from chat or embeddings"
               : error.status === 500
-                ? "**Possible causes:**\n• API key not configured in backend/.env\n• Backend internal error\n\n**To fix:**\n1. Check backend/.env has OPENAI_API_KEY or ANTHROPIC_API_KEY\n2. Check backend logs for errors"
+                ? "**Possible causes:**\n• Provider credentials are missing or invalid in `backend/.env`\n• Internal gateway configuration is incomplete (`PAT_TOKEN`, `AWS_GATEWAY_URL`, model names)\n• Backend internal error\n\n**To fix:**\n1. Check backend/.env has `OPENAI_API_KEY` or `PAT_TOKEN + AWS_GATEWAY_URL`\n2. Verify the configured model names are allowed by your gateway\n3. Check backend logs for errors"
                 : ""
         }`,
         timestamp: Date.now()

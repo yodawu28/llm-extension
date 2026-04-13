@@ -74,6 +74,20 @@ export interface SummarizeResponse {
     reranker_used?: boolean
     reranker_model?: string
     reranker_candidates?: number
+    input_pages?: number
+    prepared_pages?: number
+    deduped_pages?: number
+    deduped_by_url?: number
+    deduped_by_content?: number
+    high_priority_pages?: number
+    retrieval_mode?: string
+    context_budget_tokens?: number
+    retrieval_strategy?: string
+    embedding_fallback_used?: boolean
+    embedding_provider_forbidden?: boolean
+    routing_note?: string
+    selected_sources_summary?: string
+    omitted_sources_summary?: string
     cost_estimate?: {
       input_cost: number
       output_cost: number
@@ -110,6 +124,20 @@ export interface CritiqueResponse {
     reranker_model?: string
     reranker_candidates?: number
     issues_found?: number
+    input_pages?: number
+    prepared_pages?: number
+    deduped_pages?: number
+    deduped_by_url?: number
+    deduped_by_content?: number
+    high_priority_pages?: number
+    retrieval_mode?: string
+    context_budget_tokens?: number
+    retrieval_strategy?: string
+    embedding_fallback_used?: boolean
+    embedding_provider_forbidden?: boolean
+    routing_note?: string
+    selected_sources_summary?: string
+    omitted_sources_summary?: string
     cost_estimate?: {
       input_cost: number
       output_cost: number
@@ -147,6 +175,20 @@ export interface DiagramResponse {
     reranker_used?: boolean
     reranker_model?: string
     reranker_candidates?: number
+    input_pages?: number
+    prepared_pages?: number
+    deduped_pages?: number
+    deduped_by_url?: number
+    deduped_by_content?: number
+    high_priority_pages?: number
+    retrieval_mode?: string
+    context_budget_tokens?: number
+    retrieval_strategy?: string
+    embedding_fallback_used?: boolean
+    embedding_provider_forbidden?: boolean
+    routing_note?: string
+    selected_sources_summary?: string
+    omitted_sources_summary?: string
     cost_estimate?: {
       input_cost: number
       output_cost: number

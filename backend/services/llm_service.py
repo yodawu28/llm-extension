@@ -19,6 +19,22 @@ class LLMService:
         self.settings = get_settings()
         self.model = self._init_model()
 
+    def _supports_custom_temperature(self, model_name: str) -> bool:
+        normalized = (model_name or "").strip().lower()
+
+        # Reasoning-oriented OpenAI-compatible models often only accept the
+        # provider default temperature. Leave it unset for those families.
+        if (
+            normalized.startswith("o1") or
+            normalized.startswith("o3") or
+            normalized.startswith("o4") or
+            normalized.startswith("gpt-5") or
+            "codex" in normalized
+        ):
+            return False
+
+        return True
+
     def _init_model(self):
         """Initialize LLM based on provider setting"""
         if self.settings.llm_provider == "openai":
@@ -26,15 +42,26 @@ class LLMService:
             if not api_key:
                 raise ValueError("OpenAI API key or PAT token not found in settings")
 
-            return ChatOpenAI(
+            init_kwargs = dict(
                 api_key=api_key,
                 model=self.settings.openai_model,
                 base_url=self.settings.resolved_openai_base_url(),
-                temperature=0.3,
                 max_tokens=self.settings.max_output_tokens,
                 timeout=self.settings.request_timeout_seconds,
                 max_retries=1,
             )
+
+            if self._supports_custom_temperature(self.settings.openai_model):
+                init_kwargs["temperature"] = 0.3
+            else:
+                # LangChain defaults ChatOpenAI.temperature to 0.7. Reasoning models
+                # like o4-mini only accept the provider default temperature of 1.
+                init_kwargs["temperature"] = 1
+
+            if self.settings.openai_reasoning_effort:
+                init_kwargs["reasoning_effort"] = self.settings.openai_reasoning_effort
+
+            return ChatOpenAI(**init_kwargs)
 
         elif self.settings.llm_provider == "anthropic":
             if not self.settings.anthropic_api_key:

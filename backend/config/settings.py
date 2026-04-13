@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import List
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,11 +13,17 @@ class Settings(BaseSettings):
     debug: bool = False
 
     # LLM Provider
-    llm_provider: str = "openai"  # "openai" or "anthropic"
+    llm_provider: str = Field(
+        default="openai",
+        validation_alias=AliasChoices("LLM_PROVIDER", "MODEL_PROVIDER")
+    )  # "openai" or "anthropic"
 
     # OpenAI
     openai_api_key: str = ""
-    openai_model: str = "gpt-4o"
+    openai_model: str = Field(
+        default="gpt-4o",
+        validation_alias=AliasChoices("OPENAI_MODEL", "MODEL")
+    )
     openai_base_url: str = Field(
         default="",
         validation_alias=AliasChoices("OPENAI_BASE_URL", "AWS_GATEWAY_URL")
@@ -25,6 +31,10 @@ class Settings(BaseSettings):
     pat_token: str = Field(
         default="",
         validation_alias=AliasChoices("PAT_TOKEN", "OPENAI_PAT")
+    )
+    openai_reasoning_effort: str = Field(
+        default="",
+        validation_alias=AliasChoices("OPENAI_REASONING_EFFORT", "MODEL_REASONING_EFFORT")
     )
     openai_embedding_model: str = "text-embedding-3-small"
     openai_embedding_dimensions: int = 1536
@@ -54,6 +64,29 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
     )
+
+    @field_validator("llm_provider", mode="before")
+    @classmethod
+    def normalize_llm_provider(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        provider_aliases = {
+            "openai": "openai",
+            "anthropic": "anthropic",
+            "ly-chatai": "openai",
+            "ly_chatai": "openai",
+            "openai-compatible": "openai",
+            "openai_compatible": "openai",
+            "gateway": "openai",
+        }
+        return provider_aliases.get(normalized, normalized or "openai")
+
+    @field_validator("openai_reasoning_effort", mode="before")
+    @classmethod
+    def normalize_openai_reasoning_effort(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized == "xhigh":
+            return "high"
+        return normalized if normalized in {"", "low", "medium", "high"} else ""
 
     def resolved_openai_api_key(self) -> str:
         """Prefer internal PAT when provided, otherwise use the standard OpenAI key."""

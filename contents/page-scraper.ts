@@ -36,6 +36,7 @@ interface GhostCriticIssue {
   evidence: string
   risk?: string
   suggestion?: string
+  source_title?: string
 }
 
 const TOAST_ROOT_ID = "__mind-reader-toast"
@@ -297,17 +298,32 @@ function buildCollapsedIndex(text: string) {
   }
 }
 
-function buildGhostCriticSearchCandidates(evidence: string): string[] {
+function buildGhostCriticSearchCorpus(issue: GhostCriticIssue) {
+  return [
+    issue.title,
+    issue.evidence,
+    issue.risk || "",
+    issue.suggestion || ""
+  ]
+    .map((part) => normalizeSearchText(part))
+    .filter(Boolean)
+    .join(". ")
+}
+
+function buildGhostCriticSearchCandidates(issue: GhostCriticIssue): string[] {
   const normalizedEvidence = normalizeSearchText(
-    evidence
+    issue.evidence
       .replace(/^[\s"'`-]+|[\s"'`-]+$/g, "")
       .replace(/\b(paraphrased|paraphrase|approx\.?|approximately)\b:?/gi, "")
   )
+  const normalizedTitle = normalizeSearchText(issue.title)
+  const normalizedRisk = normalizeSearchText(issue.risk || "")
+  const normalizedSuggestion = normalizeSearchText(issue.suggestion || "")
 
   const candidates = new Set<string>()
 
   const quotedMatches = Array.from(
-    evidence.matchAll(/["“](.+?)["”]/g),
+    issue.evidence.matchAll(/["“](.+?)["”]/g),
     (match) => normalizeSearchText(match[1] || "")
   )
 
@@ -321,11 +337,27 @@ function buildGhostCriticSearchCandidates(evidence: string): string[] {
     candidates.add(normalizedEvidence)
   }
 
+  if (normalizedTitle.length >= 12) {
+    candidates.add(normalizedTitle)
+  }
+
+  if (normalizedTitle && normalizedEvidence) {
+    candidates.add(`${normalizedTitle}. ${normalizedEvidence}`.slice(0, 220))
+  }
+
   normalizedEvidence
     .split(/(?:\.\s+|\n+|•)/)
     .map((part) => normalizeSearchText(part))
     .filter((part) => part.length >= 24)
     .forEach((part) => candidates.add(part))
+
+  if (normalizedRisk.length >= 24) {
+    candidates.add(normalizedRisk)
+  }
+
+  if (normalizedSuggestion.length >= 24) {
+    candidates.add(normalizedSuggestion)
+  }
 
   const words = normalizedEvidence.split(/\s+/).filter(Boolean)
 
@@ -335,6 +367,11 @@ function buildGhostCriticSearchCandidates(evidence: string): string[] {
 
   if (words.length >= 14) {
     candidates.add(words.slice(0, Math.min(words.length, 18)).join(" "))
+  }
+
+  const titleWords = normalizedTitle.split(/\s+/).filter(Boolean)
+  if (titleWords.length >= 3) {
+    candidates.add(titleWords.slice(0, Math.min(titleWords.length, 8)).join(" "))
   }
 
   return Array.from(candidates).sort((left, right) => right.length - left.length)
@@ -405,10 +442,10 @@ function shouldSkipGhostCriticElement(element: HTMLElement | null) {
   return text.length < 24 || text.length > 900
 }
 
-function findFuzzyBlockRange(evidence: string, usedElements: Set<HTMLElement>): Range | null {
-  const evidenceTokens = Array.from(new Set(tokenizeGhostCriticText(evidence)))
+function findFuzzyBlockRange(issue: GhostCriticIssue, usedElements: Set<HTMLElement>): Range | null {
+  const evidenceTokens = Array.from(new Set(tokenizeGhostCriticText(buildGhostCriticSearchCorpus(issue))))
 
-  if (evidenceTokens.length < 4) {
+  if (evidenceTokens.length < 3) {
     return null
   }
 
@@ -431,7 +468,7 @@ function findFuzzyBlockRange(evidence: string, usedElements: Set<HTMLElement>): 
     }
 
     const matchedTokenCount = evidenceTokens.filter((token) => elementTokens.has(token)).length
-    const minRequiredMatches = evidenceTokens.length >= 10 ? 4 : 3
+    const minRequiredMatches = evidenceTokens.length >= 10 ? 4 : 2
 
     if (matchedTokenCount < minRequiredMatches) {
       continue
@@ -449,7 +486,7 @@ function findFuzzyBlockRange(evidence: string, usedElements: Set<HTMLElement>): 
     bestElement = element
   }
 
-  if (!bestElement || bestScore < 0.38) {
+  if (!bestElement || bestScore < 0.24) {
     return null
   }
 
@@ -574,7 +611,7 @@ function highlightGhostCriticIssues(issues: GhostCriticIssue[]) {
   const usedFuzzyElements = new Set<HTMLElement>()
 
   issues.forEach((issue) => {
-    const candidates = buildGhostCriticSearchCandidates(issue.evidence)
+    const candidates = buildGhostCriticSearchCandidates(issue)
     let matchedRange: Range | null = null
 
     for (const candidate of candidates) {
@@ -589,7 +626,7 @@ function highlightGhostCriticIssues(issues: GhostCriticIssue[]) {
     }
 
     if (!matchedRange) {
-      matchedRange = findFuzzyBlockRange(issue.evidence, usedFuzzyElements)
+      matchedRange = findFuzzyBlockRange(issue, usedFuzzyElements)
     }
 
     if (!matchedRange) {
