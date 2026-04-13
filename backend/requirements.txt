@@ -1,0 +1,26 @@
+# Web Framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-dotenv==1.0.1
+
+# CORS
+python-multipart==0.0.18
+
+# LLM Integration
+openai==1.59.6
+anthropic>=0.47.0
+langchain==0.3.14
+langchain-openai==0.2.14
+langchain-anthropic==0.3.8
+langchain-text-splitters==0.3.4
+
+# Data Validation
+pydantic==2.10.6
+pydantic-settings==2.7.1
+
+# Utilities
+tiktoken==0.8.0
+
+# Vector Store & Embeddings
+faiss-cpu==1.9.0
+numpy==2.2.2

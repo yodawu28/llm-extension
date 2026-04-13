@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+.pnpm-debug.log
+
+# Build output
+build/
+dist/
+.plasmo/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.log
+*.backup
+*.tsbuildinfo
+
+# Local scratch files
+test-*.html
+
+# Backend Python
+backend/venv/
+backend/.env
+backend/__pycache__/
+backend/**/__pycache__/
+backend/**/*.pyc
+backend/*.egg-info/
+
+.claude
+docs
+AGENTS.md
+CLAUDE.md
