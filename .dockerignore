@@ -1,0 +1,15 @@
+.git
+.gitignore
+.claude
+.plasmo
+build
+docker-dist
+node_modules
+backend/.env
+backend/__pycache__
+backend/venv
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.tsbuildinfo

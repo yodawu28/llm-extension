@@ -69,6 +69,7 @@ AWS_GATEWAY_URL=https://genai-gateway.flava-cloud.com/
 PAT_TOKEN=your-internal-pat
 OPENAI_MODEL=gpt-4o
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+REQUEST_TIMEOUT_SECONDS=120
 ```
 
 ### 4. Run backend
@@ -86,6 +87,112 @@ pnpm dev
 ```
 
 Load the generated unpacked extension into Chrome from the Plasmo dev output.
+
+## Docker
+
+The backend can run in Docker. The extension itself still runs in Chrome, but this repo also includes a Docker-based builder that outputs the packaged extension files.
+
+### Docker onboarding
+
+Shortcut flow:
+
+```bash
+make check-env
+make docker-up
+make docker-smoke
+make docker-build-extension
+```
+
+Manual flow:
+
+1. Copy compose variables:
+
+```bash
+cp .env.compose.example .env.compose
+```
+
+2. Copy backend secrets/config:
+
+```bash
+cp backend/.env.example backend/.env
+```
+
+3. Update `backend/.env` with your provider config
+4. Start the backend:
+
+```bash
+docker compose --env-file .env.compose up --build -d backend
+```
+
+5. Optional smoke check:
+
+```bash
+docker compose --env-file .env.compose --profile check up backend-smoke
+```
+
+6. Build the extension artifact:
+
+```bash
+docker compose --env-file .env.compose --profile build run --rm extension-builder
+```
+
+7. Load the unpacked extension from `docker-dist/chrome-mv3-prod` into Chrome
+
+### Makefile shortcuts
+
+```bash
+make docker-setup
+make check-env
+make docker-up
+make docker-smoke
+make docker-build-extension
+make docker-logs
+make docker-down
+```
+
+What they do:
+- `make docker-setup`: create `.env.compose` and `backend/.env` from examples if missing
+- `make check-env`: validate `backend/.env` before Docker startup
+- `make docker-up`: build and start the backend
+- `make docker-smoke`: call the backend health endpoint through the compose network
+- `make docker-build-extension`: build the Chrome extension artifact into `docker-dist/`
+- `make docker-logs`: tail backend logs
+- `make docker-down`: stop the compose stack
+
+### Run backend with Docker Compose
+
+1. Configure [backend/.env](/Users/long.vo/workspaces/personal/side-projects/llm-extensions/backend/.env)
+2. Start the API:
+
+```bash
+docker compose --env-file .env.compose up --build -d backend
+```
+
+The backend will be available at `http://localhost:8000` by default, or the port set in `.env.compose`.
+
+The compose stack now includes:
+- a backend `healthcheck`
+- a `backend-smoke` service that waits for `service_healthy`
+- `extension-builder` depending on the backend health state for a cleaner internal workflow
+
+### Build the extension with Docker Compose
+
+```bash
+docker compose --env-file .env.compose --profile build run --rm extension-builder
+```
+
+This writes the unpacked production build and packaged zip into `docker-dist/` by default, or the directory set in `.env.compose`.
+
+### Recommended Docker flow for internal users
+
+1. Run `cp .env.compose.example .env.compose`
+2. Run `cp backend/.env.example backend/.env`
+3. Fill in `backend/.env`
+4. Run `docker compose --env-file .env.compose up --build -d backend`
+5. Run `docker compose --env-file .env.compose --profile check up backend-smoke`
+6. Run `docker compose --env-file .env.compose --profile build run --rm extension-builder`
+7. Load the extracted build from `docker-dist/chrome-mv3-prod` in Chrome
+8. Point the extension to the backend URL with `PLASMO_PUBLIC_API_BASE_URL`
 
 ## Packaging For A Few Users
 
@@ -173,5 +280,6 @@ uvicorn main:app --reload --host 127.0.0.1 --port 8000
 
 - The extension defaults to `http://localhost:8000` if no frontend env override is provided.
 - The backend supports both standard `OPENAI_API_KEY` and internal `PAT_TOKEN + AWS_GATEWAY_URL` for OpenAI-compatible gateways.
+- The Docker backend image installs optional local embedding and reranker dependencies too, so `EMBEDDING_PROVIDER=local` works there as well.
 - `Clear Cache` in the UI also clears saved diagram cache.
 - Generated folders like `build/`, `.plasmo/`, and Python/TS caches should not be committed.

@@ -5,6 +5,7 @@ import notificationIconUrl from "url:~assets/icon128.png"
 import { LinkScanner, type LinkedResource } from "~lib/link-scanner"
 import { BackgroundFetcher, type FetchedResource } from "~lib/background-fetcher"
 import { EXTENSION_BUILD_LABEL } from "~lib/build-info"
+import { readUserSettings } from "~lib/user-settings"
 
 // State management
 let lastScannedURL: string | null = null
@@ -41,6 +42,10 @@ async function getPinnedPageUrlSet() {
 async function filterPinnedResources(resources: LinkedResource[]) {
   const pinnedUrls = await getPinnedPageUrlSet()
   return resources.filter((resource) => !pinnedUrls.has(resource.url))
+}
+
+async function clearDiscoveredResources(tabId: number) {
+  await chrome.storage.local.remove(`discovered_links_${tabId}`)
 }
 
 async function syncDiscoveredResourcesAfterImport(tabId: number, importedUrls: string[]) {
@@ -223,6 +228,23 @@ async function initializeSidePanelBehavior() {
 
 void initializeSidePanelBehavior()
 
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "local" || !changes.userSettings) {
+    return
+  }
+
+  const nextSettings = {
+    ...(changes.userSettings.oldValue || {}),
+    ...(changes.userSettings.newValue || {})
+  }
+
+  if (nextSettings.mindReaderScanMode === "manual" || nextSettings.mindReaderScanMode === "off") {
+    lastScannedURL = null
+    scanInProgress = false
+    void clearAllMindReaderBadges()
+  }
+})
+
 // When user clicks the extension icon, clear the badge.
 // The actual panel opening is delegated to openPanelOnActionClick.
 chrome.action.onClicked.addListener(async (tab) => {
@@ -290,27 +312,69 @@ chrome.tabs.onUpdated.addListener(async (tabId: any, changeInfo: any, tab: any) 
   }
 })
 
-/**
- * Mind Reader: Automatically scan page for related documentation links
- */
-async function autoScanForRelatedLinks(tabId: number, url: string) {
+async function runMindReaderScan(
+  tabId: number,
+  url: string,
+  options?: {
+    force?: boolean
+    mode?: "auto" | "manual"
+  }
+) {
+  const scanMode = options?.mode || "auto"
   console.log(`[Mind Reader] Tab updated: ${url}`)
 
+  if (!options?.force) {
+    const userSettings = await readUserSettings()
+    if (scanMode === "auto" && userSettings.mindReaderScanMode !== "auto") {
+      console.log(`[Mind Reader] ⏭️ Skip - auto-scan disabled`)
+      await clearMindReaderBadge(tabId)
+      return {
+        success: false,
+        skipped: true,
+        reason: "Auto-scan is disabled"
+      }
+    }
+
+    if (scanMode === "manual" && userSettings.mindReaderScanMode === "off") {
+      console.log(`[Mind Reader] ⏭️ Skip - manual scan disabled`)
+      await clearMindReaderBadge(tabId)
+      return {
+        success: false,
+        skipped: true,
+        reason: "Mind Reader is turned off"
+      }
+    }
+  }
+
   // Skip if already scanned recently
-  if (lastScannedURL === url) {
+  if (!options?.force && lastScannedURL === url) {
     console.log(`[Mind Reader] ⏭️ Skip - already scanned: ${url}`)
-    return
+    return {
+      success: false,
+      skipped: true,
+      reason: "This page was already scanned recently"
+    }
   }
 
   if (scanInProgress) {
     console.log(`[Mind Reader] ⏭️ Skip - scan in progress`)
-    return
+    return {
+      success: false,
+      skipped: true,
+      reason: "A scan is already in progress"
+    }
   }
 
   // Only scan Jira/Confluence/GitHub pages
   if (!shouldScanPage(url)) {
     console.log(`[Mind Reader] ⏭️ Skip - page not in scan list`)
-    return
+    await clearMindReaderBadge(tabId)
+    await clearDiscoveredResources(tabId)
+    return {
+      success: false,
+      skipped: true,
+      reason: "This page type is not supported by Mind Reader"
+    }
   }
 
   console.log(`[Mind Reader] 🔍 Starting scan for: ${url}`)
@@ -351,16 +415,34 @@ async function autoScanForRelatedLinks(tabId: number, url: string) {
             timestamp: Date.now()
           }
         })
+        return {
+          success: true,
+          foundCount: freshResources.length
+        }
       } else {
         console.log(`[Mind Reader] ℹ️ No new related links found after excluding already imported pages`)
+        await clearDiscoveredResources(tabId)
         await clearMindReaderBadge(tabId)
+        return {
+          success: true,
+          foundCount: 0
+        }
       }
     } else {
       console.log(`[Mind Reader] ℹ️ No links found on page`)
+      await clearDiscoveredResources(tabId)
       await clearMindReaderBadge(tabId)
+      return {
+        success: true,
+        foundCount: 0
+      }
     }
   } catch (error) {
     console.error("[Mind Reader] ❌ Scan failed:", error)
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : "Scan failed"
+    }
   } finally {
     scanInProgress = false
 
@@ -371,6 +453,17 @@ async function autoScanForRelatedLinks(tabId: number, url: string) {
       }
     }, SCAN_COOLDOWN_MS)
   }
+}
+
+/**
+ * Mind Reader: Automatically scan page for related documentation links
+ */
+async function autoScanForRelatedLinks(tabId: number, url: string) {
+  await runMindReaderScan(tabId, url, { mode: "auto" })
+}
+
+async function manuallyScanCurrentTab(tabId: number, url: string) {
+  return runMindReaderScan(tabId, url, { mode: "manual", force: true })
 }
 
 /**
@@ -555,12 +648,17 @@ function shouldScanPage(url: string): boolean {
 async function showLinkSuggestionNotification(tabId: number, resources: LinkedResource[]) {
   const count = resources.length
   const types = [...new Set(resources.map(r => r.type))]
+  const userSettings = await readUserSettings()
 
   await setMindReaderBadge(tabId, count)
 
-  const shownInPage = await showInPageMindReaderToast(tabId, resources)
+  let shownInPage = false
 
-  if (!shownInPage) {
+  if (userSettings.mindReaderPopupsEnabled) {
+    shownInPage = await showInPageMindReaderToast(tabId, resources)
+  }
+
+  if (userSettings.mindReaderPopupsEnabled && !shownInPage) {
     await chrome.notifications.create(
       createNotificationId("link-suggestions"),
       {
@@ -909,6 +1007,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({
           success: false,
           error: error instanceof Error ? error.message : "Failed to dismiss toast"
+        })
+      }
+    })()
+    return true
+  }
+
+  if (message.action === "mind-reader-scan-current-tab") {
+    ;(async () => {
+      try {
+        const targetTabId: number | undefined = message.payload?.tabId ?? sender.tab?.id
+
+        if (targetTabId == null) {
+          throw new Error("No target tab available for manual Mind Reader scan")
+        }
+
+        const tab = await chrome.tabs.get(targetTabId)
+        if (!tab.url) {
+          throw new Error("Current tab URL is not available")
+        }
+
+        const result = await manuallyScanCurrentTab(targetTabId, tab.url)
+        sendResponse({
+          success: result.success,
+          foundCount: result.foundCount || 0,
+          skipped: result.skipped || false,
+          reason: result.reason,
+          error: result.error
+        })
+      } catch (error) {
+        sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : "Manual scan failed"
         })
       }
     })()

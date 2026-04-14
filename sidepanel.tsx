@@ -12,6 +12,12 @@ import type {
 import { apiClient } from "~lib/api"
 import { EXTENSION_BUILD_LABEL } from "~lib/build-info"
 import type { LinkedResource } from "~lib/link-scanner"
+import {
+  DEFAULT_USER_SETTINGS,
+  readUserSettings,
+  updateUserSettings,
+  type UserSettings
+} from "~lib/user-settings"
 import { MarkdownMessage } from "~components/MarkdownMessage"
 
 interface ContextPage {
@@ -123,6 +129,13 @@ const TITLE_MATCH_STOP_WORDS = new Set([
   "the",
   "this",
   "with"
+])
+
+const USER_FACING_DIAGNOSTIC_LABELS = new Set([
+  "Context focus",
+  "Selected sources",
+  "Ignored pages",
+  "Routing note"
 ])
 
 // Mock summary for testing
@@ -247,6 +260,21 @@ function normalizeTitleForMatching(value: string) {
     .replace(/[\[\]()"':]/g, " ")
     .replace(/\s+/g, " ")
     .trim()
+}
+
+function normalizePageUrlForMatching(value: string) {
+  try {
+    const parsed = new URL(value)
+    parsed.hash = ""
+    parsed.search = ""
+    return parsed.toString().replace(/\/+$/, "")
+  } catch {
+    return value.trim().replace(/\/+$/, "")
+  }
+}
+
+function urlsLikelyMatch(left: string, right: string) {
+  return normalizePageUrlForMatching(left) === normalizePageUrlForMatching(right)
 }
 
 function tokenizeTitleForMatching(value: string) {
@@ -415,6 +443,34 @@ function buildRagDiagnostics(response: SummarizeResponse): ChatMessage["diagnost
     })
   }
 
+  if (usage.retrieval_no_match_fallback_used) {
+    items.push({
+      label: "Query fallback",
+      value: "used top context"
+    })
+  }
+
+  if (usage.selected_sources_summary) {
+    items.push({
+      label: "Selected sources",
+      value: usage.selected_sources_summary
+    })
+  }
+
+  if (usage.omitted_sources_summary) {
+    items.push({
+      label: "Ignored pages",
+      value: usage.omitted_sources_summary
+    })
+  }
+
+  if (usage.routing_note) {
+    items.push({
+      label: "Routing note",
+      value: usage.routing_note
+    })
+  }
+
   if (usage.cost_estimate) {
     items.push({
       label: "Cost",
@@ -509,6 +565,34 @@ function buildDiagramDiagnostics(response: DiagramResponse): ChatMessage["diagno
     })
   }
 
+  if (usage.retrieval_no_match_fallback_used) {
+    items.push({
+      label: "Query fallback",
+      value: "used top context"
+    })
+  }
+
+  if (usage.selected_sources_summary) {
+    items.push({
+      label: "Selected sources",
+      value: usage.selected_sources_summary
+    })
+  }
+
+  if (usage.omitted_sources_summary) {
+    items.push({
+      label: "Ignored pages",
+      value: usage.omitted_sources_summary
+    })
+  }
+
+  if (usage.routing_note) {
+    items.push({
+      label: "Routing note",
+      value: usage.routing_note
+    })
+  }
+
   if (usage.cost_estimate) {
     items.push({
       label: "Cost",
@@ -534,6 +618,111 @@ function withCacheBadge(
     ...diagnostics,
     items: [
       { label: "Diagram cache", value: status === "hit" ? "hit" : "miss" },
+      ...diagnostics.items
+    ]
+  }
+}
+
+function splitDiagnosticsForDisplay(diagnostics: NonNullable<ChatMessage["diagnostics"]>) {
+  const whyItems = diagnostics.items.filter((item) => USER_FACING_DIAGNOSTIC_LABELS.has(item.label))
+  const technicalItems = diagnostics.items.filter((item) => !USER_FACING_DIAGNOSTIC_LABELS.has(item.label))
+
+  return {
+    whyItems,
+    technicalItems
+  }
+}
+
+function isCurrentPageScopedRequest(question: string) {
+  const normalized = question.trim().toLowerCase()
+
+  if (!normalized) {
+    return false
+  }
+
+  const directPhrases = [
+    "this page",
+    "current page",
+    "this tab",
+    "this document",
+    "this doc",
+    "this article",
+    "this ticket",
+    "this issue",
+    "this prd",
+    "this spec"
+  ]
+
+  return (
+    directPhrases.some((phrase) => normalized.includes(phrase)) ||
+    /\b(summarize|summarise|review|critique|explain|diagram|visualize|visualise)\b[\s\S]*\b(this|current)\s+(page|tab|document|doc|article|ticket|issue|prd|spec)\b/.test(normalized)
+  )
+}
+
+function detectContextIntent(
+  question: string,
+  currentPageTitle?: string
+): {
+  mode: "default" | "current-only" | "compare-current-vs-pinned"
+  rewrittenQuestion?: string
+} {
+  const normalized = question.trim().toLowerCase()
+  const currentTitle = (currentPageTitle || "current page").trim()
+  const hasCurrentPageReference = /\b(this|current)\s+(page|tab|document|doc|article|ticket|issue|prd|spec)\b/.test(normalized)
+
+  const compareCurrentPage =
+    /\b(compare|difference|different|diff|versus|vs\.?)\b/.test(normalized) &&
+    hasCurrentPageReference
+
+  const compareWithPinned =
+    hasCurrentPageReference &&
+    /\b(pinned|context basket|basket|other docs|other pages|reference docs|reference pages)\b/.test(normalized)
+
+  if (compareCurrentPage || compareWithPinned) {
+    return {
+      mode: "compare-current-vs-pinned",
+      rewrittenQuestion: `Compare the current page titled "${currentTitle}" against the other pinned pages. Highlight agreements, contradictions, missing context, and the most important differences.`
+    }
+  }
+
+  const currentOnlyPhrases = [
+    "only this page",
+    "this page only",
+    "only current page",
+    "current page only",
+    "only this doc",
+    "this doc only",
+    "only this document",
+    "this document only",
+    "critique this page only",
+    "summarize only this page",
+    "summarise only this page",
+    "review this page only"
+  ]
+
+  if (currentOnlyPhrases.some((phrase) => normalized.includes(phrase)) || isCurrentPageScopedRequest(question)) {
+    return {
+      mode: "current-only"
+    }
+  }
+
+  return {
+    mode: "default"
+  }
+}
+
+function prependContextFocusDiagnostic(
+  diagnostics: ChatMessage["diagnostics"],
+  focusLabel: string
+): ChatMessage["diagnostics"] {
+  if (!diagnostics || !focusLabel.trim()) {
+    return diagnostics
+  }
+
+  return {
+    ...diagnostics,
+    items: [
+      { label: "Context focus", value: focusLabel },
       ...diagnostics.items
     ]
   }
@@ -664,6 +853,34 @@ function buildCritiqueDiagnostics(response: CritiqueResponse): ChatMessage["diag
     })
   }
 
+  if (usage.retrieval_no_match_fallback_used) {
+    items.push({
+      label: "Query fallback",
+      value: "used top context"
+    })
+  }
+
+  if (usage.selected_sources_summary) {
+    items.push({
+      label: "Selected sources",
+      value: usage.selected_sources_summary
+    })
+  }
+
+  if (usage.omitted_sources_summary) {
+    items.push({
+      label: "Ignored pages",
+      value: usage.omitted_sources_summary
+    })
+  }
+
+  if (usage.routing_note) {
+    items.push({
+      label: "Routing note",
+      value: usage.routing_note
+    })
+  }
+
   return {
     title: "Critique Stats",
     items
@@ -694,6 +911,8 @@ function SidePanel() {
   const [showPinToast, setShowPinToast] = useState(false)
   const [bannerToast, setBannerToast] = useState<BannerToast | null>(null)
   const [isMaintenanceBusy, setIsMaintenanceBusy] = useState(false)
+  const [isMindReaderScanBusy, setIsMindReaderScanBusy] = useState(false)
+  const [userSettings, setUserSettings] = useState<UserSettings>(DEFAULT_USER_SETTINGS)
   const [highlightingCritiqueId, setHighlightingCritiqueId] = useState<string | null>(null)
   const [discoveredResources, setDiscoveredResources] = useState<LinkedResource[]>([])
   const [addingSuggestionUrl, setAddingSuggestionUrl] = useState<string | null>(null)
@@ -837,6 +1056,10 @@ function SidePanel() {
     loadPinnedPages()
   }, [])
 
+  useEffect(() => {
+    void loadUserSettings()
+  }, [])
+
   // Update total tokens and check limits
   useEffect(() => {
     const total = pinnedPages.reduce((sum, page) => sum + page.tokenEstimate, 0)
@@ -893,9 +1116,153 @@ function SidePanel() {
     setPinnedPages(result.pinnedPages || [])
   }
 
+  async function loadUserSettings() {
+    try {
+      setUserSettings(await readUserSettings())
+    } catch (error) {
+      console.error("Error loading user settings:", error)
+    }
+  }
+
   async function savePinnedPages(updatedPages: ContextPage[]) {
     await chrome.storage.local.set({ pinnedPages: updatedPages })
     setPinnedPages(updatedPages)
+  }
+
+  async function setMindReaderScanMode(nextMode: UserSettings["mindReaderScanMode"]) {
+    try {
+      const nextSettings = await updateUserSettings({
+        mindReaderScanMode: nextMode
+      })
+      setUserSettings(nextSettings)
+      showBannerToast({
+        title:
+          nextMode === "auto"
+            ? "Mind Reader auto-scan enabled"
+            : nextMode === "manual"
+              ? "Mind Reader manual mode enabled"
+              : "Mind Reader turned off",
+        message:
+          nextMode === "auto"
+            ? "Related docs will be detected automatically on supported pages."
+            : nextMode === "manual"
+              ? "Mind Reader will scan only when you click Scan Now."
+              : "Mind Reader scanning and prompts are disabled.",
+        tone: "success"
+      })
+    } catch (error) {
+      console.error("Error updating user settings:", error)
+    }
+  }
+
+  async function toggleMindReaderPopups() {
+    try {
+      const nextSettings = await updateUserSettings({
+        mindReaderPopupsEnabled: !userSettings.mindReaderPopupsEnabled
+      })
+      setUserSettings(nextSettings)
+      showBannerToast({
+        title: nextSettings.mindReaderPopupsEnabled ? "Mind Reader popups enabled" : "Mind Reader popups disabled",
+        message: nextSettings.mindReaderPopupsEnabled
+          ? "In-page import prompts and Chrome notifications are back on."
+          : "Related docs will still be scanned, but popup prompts are now hidden.",
+        tone: "success"
+      })
+    } catch (error) {
+      console.error("Error updating user settings:", error)
+    }
+  }
+
+  async function handleManualMindReaderScan() {
+    if (!currentPage?.tabId || isMindReaderScanBusy || userSettings.mindReaderScanMode === "off") {
+      return
+    }
+
+    setIsMindReaderScanBusy(true)
+
+    try {
+      const response = await chrome.runtime.sendMessage({
+        action: "mind-reader-scan-current-tab",
+        payload: {
+          tabId: currentPage.tabId
+        }
+      })
+
+      if (!response?.success) {
+        throw new Error(response?.error || response?.reason || "Mind Reader scan failed")
+      }
+
+      const foundCount = Number(response.foundCount || 0)
+      showBannerToast(
+        foundCount > 0
+          ? {
+              title: "Mind Reader scan completed",
+              message: `Found ${foundCount} related document${foundCount > 1 ? "s" : ""} for this page.`,
+              tone: "success"
+            }
+          : {
+              title: "Mind Reader found no new related docs",
+              message: "This page was scanned, but no new suggestions were found.",
+              tone: "info"
+            },
+        4500
+      )
+
+      await loadDiscoveredResources(currentPage.tabId)
+    } catch (error) {
+      console.error("Error running manual Mind Reader scan:", error)
+      showBannerToast({
+        title: "Could not scan this page",
+        message: error instanceof Error ? error.message : "Mind Reader scan failed.",
+        tone: "info"
+      }, 5000)
+    } finally {
+      setIsMindReaderScanBusy(false)
+    }
+  }
+
+  async function loadPageContentFromStorage(page: ContextPage): Promise<APIPageContent | null> {
+    const storageKey = `page_${page.id}`
+    const result = await chrome.storage.local.get(storageKey)
+    const pageData = result[storageKey]
+    const markdown = String(pageData?.markdown || "").trim()
+
+    if (!markdown) {
+      return null
+    }
+
+    return {
+      title: page.title,
+      url: page.url,
+      markdown,
+      source_type: detectSourceType(page.url),
+      metadata: pageData?.metadata || {}
+    }
+  }
+
+  async function scrapeCurrentPageForContext(): Promise<APIPageContent | null> {
+    if (!currentPage?.tabId) {
+      return null
+    }
+
+    try {
+      const response = await chrome.tabs.sendMessage(currentPage.tabId, { action: "scrape-page" })
+
+      if (!response?.success || !response.data) {
+        return null
+      }
+
+      return {
+        title: response.data.title,
+        url: response.data.url,
+        markdown: response.data.markdownContent,
+        source_type: detectSourceType(response.data.url),
+        metadata: response.data.metadata || {}
+      }
+    } catch (error) {
+      console.warn("Could not scrape current page for scoped request:", error)
+      return null
+    }
   }
 
   async function togglePinCurrentPage() {
@@ -1228,37 +1595,67 @@ function SidePanel() {
       } else {
         const diagramMode = isDiagramRequest(userQuestion)
         const critiqueMode = !diagramMode && isCritiqueRequest(userQuestion)
+        const contextIntent = detectContextIntent(userQuestion, currentPage?.title)
         let diagramCacheKey: string | null = null
+        let contextFocusLabel: string | null = null
+        let effectiveUserQuestion = userQuestion
 
         // Real API mode: Call backend with Phase 2 RAG pipeline
         // 1. Fetch markdown content from storage for all pinned pages
         setProcessingStage("📄 Loading pages...")
 
         const pagesWithMarkdown: APIPageContent[] = (
-          await Promise.all(
-            pinnedPages.map(async (page) => {
-              const storageKey = `page_${page.id}`
-              const result = await chrome.storage.local.get(storageKey)
-              const pageData = result[storageKey]
-
-              return {
-                title: page.title,
-                url: page.url,
-                markdown: pageData?.markdown || "",
-                source_type: detectSourceType(page.url),
-                metadata: pageData?.metadata || {}
-              }
-            })
-          )
-        ).filter((page) => page.markdown.trim().length > 0)
+          await Promise.all(pinnedPages.map((page) => loadPageContentFromStorage(page)))
+        ).filter((page): page is APIPageContent => Boolean(page?.markdown.trim().length))
 
         if (pagesWithMarkdown.length === 0) {
           throw new Error("Pinned pages do not have imported content yet. Please pin or import them again.")
         }
 
+        let requestPages = pagesWithMarkdown
+
+        if (contextIntent.mode === "current-only" && currentPage) {
+          const matchingPinnedPage = pagesWithMarkdown.find((page) => urlsLikelyMatch(page.url, currentPage.url))
+
+          if (matchingPinnedPage) {
+            requestPages = [matchingPinnedPage]
+            contextFocusLabel = `Focused current page: ${matchingPinnedPage.title}`
+          } else {
+            setProcessingStage("📍 Reading current page...")
+            const scrapedCurrentPage = await scrapeCurrentPageForContext()
+
+            if (scrapedCurrentPage?.markdown.trim()) {
+              requestPages = [scrapedCurrentPage]
+              contextFocusLabel = `Focused live page: ${scrapedCurrentPage.title}`
+            } else {
+              contextFocusLabel = "Current page focus requested, but the active tab could not be read"
+            }
+          }
+        } else if (contextIntent.mode === "compare-current-vs-pinned" && currentPage) {
+          const matchingPinnedPage = pagesWithMarkdown.find((page) => urlsLikelyMatch(page.url, currentPage.url))
+          const currentPageContent = matchingPinnedPage || await scrapeCurrentPageForContext()
+
+          if (currentPageContent?.markdown.trim()) {
+            const referencePages = pagesWithMarkdown.filter(
+              (page) => !urlsLikelyMatch(page.url, currentPageContent.url)
+            )
+
+            if (referencePages.length > 0) {
+              requestPages = [currentPageContent, ...referencePages]
+              effectiveUserQuestion = contextIntent.rewrittenQuestion || userQuestion
+              contextFocusLabel = `Comparing current page against ${referencePages.length} pinned page${referencePages.length > 1 ? "s" : ""}`
+            } else {
+              requestPages = [currentPageContent]
+              contextFocusLabel = "Compare requested, but only the current page was available"
+            }
+          } else {
+            contextFocusLabel = "Compare requested, but the current page could not be read"
+          }
+        }
+
         if (diagramMode) {
           try {
-            diagramCacheKey = await buildDiagramCacheKey(userQuestion, pagesWithMarkdown)
+            diagramCacheKey = await buildDiagramCacheKey(effectiveUserQuestion, requestPages)
             setProcessingStage("⚡ Checking diagram cache...")
             const cachedDiagram = await readDiagramCache(diagramCacheKey)
 
@@ -1275,7 +1672,10 @@ function SidePanel() {
                 content,
                 timestamp: Date.now(),
                 citations: cachedDiagram.citations,
-                diagnostics: withCacheBadge(buildDiagramDiagnostics(cachedDiagram), "hit")
+                diagnostics: prependContextFocusDiagnostic(
+                  withCacheBadge(buildDiagramDiagnostics(cachedDiagram), "hit"),
+                  contextFocusLabel || ""
+                )
               }
 
               setMessages((prev) => [...prev, assistantMessage])
@@ -1296,12 +1696,12 @@ function SidePanel() {
         setProcessingStage("🔍 Searching relevant content...")
         if (diagramMode) {
           const response = await apiClient.generateDiagram({
-            pages: pagesWithMarkdown,
-            user_question: userQuestion
+            pages: requestPages,
+            user_question: effectiveUserQuestion
           })
 
           try {
-            const cacheKey = diagramCacheKey || await buildDiagramCacheKey(userQuestion, pagesWithMarkdown)
+            const cacheKey = diagramCacheKey || await buildDiagramCacheKey(effectiveUserQuestion, requestPages)
             await writeDiagramCache(cacheKey, response)
           } catch (error) {
             console.warn("Diagram cache write failed:", error)
@@ -1320,15 +1720,18 @@ function SidePanel() {
             content,
             timestamp: Date.now(),
             citations: response.citations,
-            diagnostics: withCacheBadge(buildDiagramDiagnostics(response), "miss")
+            diagnostics: prependContextFocusDiagnostic(
+              withCacheBadge(buildDiagramDiagnostics(response), "miss"),
+              contextFocusLabel || ""
+            )
           }
 
           setMessages((prev) => [...prev, assistantMessage])
         } else if (critiqueMode) {
           setProcessingStage("🕳️ Looking for gaps...")
           const response = await apiClient.critique({
-            pages: pagesWithMarkdown,
-            user_question: userQuestion
+            pages: requestPages,
+            user_question: effectiveUserQuestion
           })
 
           setProcessingStage("🧪 Writing review...")
@@ -1339,7 +1742,10 @@ function SidePanel() {
             timestamp: Date.now(),
             citations: response.citations,
             critiqueIssues: response.issues,
-            diagnostics: buildCritiqueDiagnostics(response)
+            diagnostics: prependContextFocusDiagnostic(
+              buildCritiqueDiagnostics(response),
+              contextFocusLabel || ""
+            )
           }
 
           setProcessingStage("✍️ Streaming review...")
@@ -1351,8 +1757,8 @@ function SidePanel() {
           }
         } else {
           const response = await apiClient.ragSummarize({
-            pages: pagesWithMarkdown,
-            user_question: userQuestion
+            pages: requestPages,
+            user_question: effectiveUserQuestion
           })
 
           setProcessingStage("🤔 Thinking...")
@@ -1370,7 +1776,10 @@ function SidePanel() {
             timestamp: Date.now(),
             citations: response.citations,
             suggestions: filteredSuggestions,
-            diagnostics: buildRagDiagnostics(response)
+            diagnostics: prependContextFocusDiagnostic(
+              buildRagDiagnostics(response),
+              contextFocusLabel || ""
+            )
           }
 
           setProcessingStage("✍️ Streaming response...")
@@ -1389,8 +1798,14 @@ function SidePanel() {
             ? "**Possible causes:**\n• Backend server is not running\n• Backend is not accessible at http://localhost:8000\n\n**To fix:**\n1. Start backend: `cd backend && source venv/bin/activate && uvicorn main:app --reload`\n2. Check backend is running at http://localhost:8000/api/health"
             : error.status === 408 || error.message?.toLowerCase?.().includes("timed out")
               ? "**Possible causes:**\n• Backend request is hanging on embeddings or LLM call\n• API provider is slow or unreachable\n\n**To fix:**\n1. Check backend terminal logs\n2. Verify `backend/.env` has valid provider credentials (`OPENAI_API_KEY` or `PAT_TOKEN + AWS_GATEWAY_URL`)\n3. Try a smaller set of pinned pages and retry"
+            : (error.detail || error.message || "").toLowerCase().includes("no relevant content found")
+              ? "**Possible causes:**\n• The question wording does not overlap enough with the pinned pages\n• The pinned pages are related, but not explicit enough for retrieval\n\n**To fix:**\n1. Rephrase the question with terms that appear in the documents\n2. Pin a more direct PRD/spec/page for this topic\n3. Retry once after narrowing the context basket"
+            : (error.detail || error.message || "").toLowerCase().includes("do not contain enough overlapping context")
+              ? "**Possible causes:**\n• The current pinned pages do not cover this topic well enough\n• Retrieval could not find a confident match in the available context\n\n**To fix:**\n1. Pin a more relevant page for this topic\n2. Ask a narrower question using the document's own terminology\n3. Remove unrelated pages and retry"
+            : (error.detail || error.message || "").toLowerCase().includes("do not contain enough usable context")
+              ? "**Possible causes:**\n• The pinned pages are too weakly related to the question\n• Most of the current basket is noise for this request\n\n**To fix:**\n1. Remove unrelated pages from the context basket\n2. Pin a more direct PRD/spec/page for this topic\n3. Rephrase the question using the source document's wording"
             : error.status === 400
-              ? "**Possible causes:**\n• Input too large (exceeded token limit)\n• Invalid request format"
+              ? "**Possible causes:**\n• Input too large (exceeded token limit)\n• The current request or pinned context is not specific enough"
               : (error.detail || error.message || "").toLowerCase().includes("gateway forbids the chat model")
                 ? "**Possible causes:**\n• `OPENAI_MODEL` is not on the gateway allow-list\n• The PAT has access to the gateway but not to this chat provider/model\n\n**To fix:**\n1. Check `backend/.env` for `OPENAI_MODEL`\n2. Switch to a model explicitly allowed by the gateway\n3. Restart backend after updating `.env`"
               : (error.detail || error.message || "").toLowerCase().includes("selected provider is forbidden")
@@ -1492,36 +1907,104 @@ function SidePanel() {
           </button>
         </div>
 
-        {/* Mock mode toggle */}
+        {/* Settings */}
         <details className="plasmo-mt-2 plasmo-text-xs">
           <summary className="plasmo-text-gray-500 plasmo-cursor-pointer hover:plasmo-text-gray-700">
-            🧪 Test Mode
+            ⚙️ Settings
           </summary>
-          <div className="plasmo-mt-1 plasmo-flex plasmo-flex-wrap plasmo-gap-2">
-            <button
-              onClick={() => setMockMode(!mockMode)}
-              className={`plasmo-px-2 plasmo-py-1 plasmo-rounded plasmo-text-xs ${
-                mockMode
-                  ? "plasmo-bg-green-100 plasmo-text-green-800"
-                  : "plasmo-bg-gray-100 plasmo-text-gray-600"
-              }`}
-            >
-              Mock: {mockMode ? "ON" : "OFF"}
-            </button>
-            <button
-              onClick={() => void handleMaintenanceAction("cache")}
-              disabled={isMaintenanceBusy}
-              className="plasmo-px-2 plasmo-py-1 plasmo-rounded plasmo-text-xs plasmo-bg-amber-50 plasmo-text-amber-800 disabled:plasmo-opacity-50"
-            >
-              Clear Cache
-            </button>
-            <button
-              onClick={() => void handleMaintenanceAction("all")}
-              disabled={isMaintenanceBusy}
-              className="plasmo-px-2 plasmo-py-1 plasmo-rounded plasmo-text-xs plasmo-bg-rose-50 plasmo-text-rose-800 disabled:plasmo-opacity-50"
-            >
-              Reset Local Data
-            </button>
+          <div className="plasmo-mt-2 plasmo-space-y-3">
+            <div className="plasmo-rounded-lg plasmo-border plasmo-border-slate-200 plasmo-bg-slate-50 plasmo-p-3">
+              <div className="plasmo-flex plasmo-items-start plasmo-justify-between plasmo-gap-3">
+                <div>
+                  <div className="plasmo-text-xs plasmo-font-semibold plasmo-text-slate-800">
+                    Mind Reader scan mode
+                  </div>
+                  <div className="plasmo-mt-1 plasmo-text-[11px] plasmo-leading-relaxed plasmo-text-slate-500">
+                    Auto scans on page load. Manual scans only when you click the button. Off disables Mind Reader entirely.
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void handleManualMindReaderScan()}
+                  disabled={isMindReaderScanBusy || userSettings.mindReaderScanMode === "off" || !currentPage}
+                  className="plasmo-rounded-md plasmo-border plasmo-border-blue-200 plasmo-bg-blue-50 plasmo-px-2.5 plasmo-py-1 plasmo-text-[11px] plasmo-font-semibold plasmo-text-blue-700 disabled:plasmo-cursor-not-allowed disabled:plasmo-opacity-50"
+                >
+                  {isMindReaderScanBusy ? "Scanning..." : "Scan Now"}
+                </button>
+              </div>
+              <div className="plasmo-mt-3 plasmo-grid plasmo-grid-cols-3 plasmo-gap-2">
+                {(["auto", "manual", "off"] as const).map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => void setMindReaderScanMode(mode)}
+                    className={`plasmo-rounded-md plasmo-border plasmo-px-2 plasmo-py-1.5 plasmo-text-[11px] plasmo-font-semibold plasmo-capitalize ${
+                      userSettings.mindReaderScanMode === mode
+                        ? "plasmo-border-primary-500 plasmo-bg-primary-600 plasmo-text-white"
+                        : "plasmo-border-slate-200 plasmo-bg-white plasmo-text-slate-600"
+                    }`}
+                  >
+                    {mode}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <label className="plasmo-flex plasmo-items-start plasmo-justify-between plasmo-gap-3 plasmo-rounded-lg plasmo-border plasmo-border-slate-200 plasmo-bg-slate-50 plasmo-p-3">
+              <div>
+                <div className="plasmo-text-xs plasmo-font-semibold plasmo-text-slate-800">
+                  Mind Reader popup import
+                </div>
+                <div className="plasmo-mt-1 plasmo-text-[11px] plasmo-leading-relaxed plasmo-text-slate-500">
+                  Show in-page import prompts and Chrome notifications when related docs are found.
+                </div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={userSettings.mindReaderPopupsEnabled}
+                onClick={() => void toggleMindReaderPopups()}
+                disabled={userSettings.mindReaderScanMode === "off"}
+                className={`plasmo-inline-flex plasmo-h-6 plasmo-w-11 plasmo-flex-shrink-0 plasmo-items-center plasmo-rounded-full plasmo-border plasmo-transition ${
+                  userSettings.mindReaderPopupsEnabled
+                    ? "plasmo-border-primary-500 plasmo-bg-primary-600"
+                    : "plasmo-border-slate-300 plasmo-bg-slate-300"
+                } disabled:plasmo-cursor-not-allowed disabled:plasmo-opacity-50`}
+              >
+                <span
+                  className={`plasmo-inline-block plasmo-h-5 plasmo-w-5 plasmo-rounded-full plasmo-bg-white plasmo-shadow-sm plasmo-transition-transform ${
+                    userSettings.mindReaderPopupsEnabled ? "plasmo-translate-x-5" : "plasmo-translate-x-0.5"
+                  }`}
+                />
+              </button>
+            </label>
+
+            <div className="plasmo-flex plasmo-flex-wrap plasmo-gap-2">
+              <button
+                onClick={() => setMockMode(!mockMode)}
+                className={`plasmo-px-2 plasmo-py-1 plasmo-rounded plasmo-text-xs ${
+                  mockMode
+                    ? "plasmo-bg-green-100 plasmo-text-green-800"
+                    : "plasmo-bg-gray-100 plasmo-text-gray-600"
+                }`}
+              >
+                Mock: {mockMode ? "ON" : "OFF"}
+              </button>
+              <button
+                onClick={() => void handleMaintenanceAction("cache")}
+                disabled={isMaintenanceBusy}
+                className="plasmo-px-2 plasmo-py-1 plasmo-rounded plasmo-text-xs plasmo-bg-amber-50 plasmo-text-amber-800 disabled:plasmo-opacity-50"
+              >
+                Clear Cache
+              </button>
+              <button
+                onClick={() => void handleMaintenanceAction("all")}
+                disabled={isMaintenanceBusy}
+                className="plasmo-px-2 plasmo-py-1 plasmo-rounded plasmo-text-xs plasmo-bg-rose-50 plasmo-text-rose-800 disabled:plasmo-opacity-50"
+              >
+                Reset Local Data
+              </button>
+            </div>
           </div>
           <div className="plasmo-mt-2 plasmo-text-[11px] plasmo-leading-relaxed plasmo-text-gray-500">
             `Clear Cache` removes fetched/import discovery cache and saved diagram results.
@@ -1748,19 +2231,49 @@ function SidePanel() {
                 </div>
 
                 {msg.role === "assistant" && msg.diagnostics && (
-                  <details className="plasmo-mt-2 plasmo-rounded-lg plasmo-border plasmo-border-gray-200 plasmo-bg-gray-50 plasmo-px-3 plasmo-py-2">
-                    <summary className="plasmo-cursor-pointer plasmo-text-[11px] plasmo-font-semibold plasmo-uppercase plasmo-tracking-[0.08em] plasmo-text-gray-500">
-                      {msg.diagnostics.title}
-                    </summary>
-                    <div className="plasmo-mt-2 plasmo-grid plasmo-grid-cols-2 plasmo-gap-x-3 plasmo-gap-y-1">
-                      {msg.diagnostics.items.map((item) => (
-                        <div key={item.label} className="plasmo-text-xs">
-                          <span className="plasmo-text-gray-500">{item.label}:</span>{" "}
-                          <span className="plasmo-font-medium plasmo-text-gray-700">{item.value}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </details>
+                  (() => {
+                    const { whyItems, technicalItems } = splitDiagnosticsForDisplay(msg.diagnostics)
+
+                    return (
+                      <div className="plasmo-mt-2 plasmo-space-y-2">
+                        {whyItems.length > 0 && (
+                          <details className="plasmo-rounded-lg plasmo-border plasmo-border-blue-100 plasmo-bg-blue-50/60 plasmo-px-3 plasmo-py-2">
+                            <summary className="plasmo-cursor-pointer plasmo-text-[11px] plasmo-font-semibold plasmo-uppercase plasmo-tracking-[0.08em] plasmo-text-blue-700">
+                              Why This Answer
+                            </summary>
+                            <div className="plasmo-mt-2 plasmo-space-y-2">
+                              {whyItems.map((item) => (
+                                <div key={item.label} className="plasmo-text-xs">
+                                  <div className="plasmo-font-semibold plasmo-text-blue-900">
+                                    {item.label}
+                                  </div>
+                                  <div className="plasmo-mt-0.5 plasmo-leading-relaxed plasmo-text-slate-700">
+                                    {item.value}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </details>
+                        )}
+
+                        {technicalItems.length > 0 && (
+                          <details className="plasmo-rounded-lg plasmo-border plasmo-border-gray-200 plasmo-bg-gray-50 plasmo-px-3 plasmo-py-2">
+                            <summary className="plasmo-cursor-pointer plasmo-text-[11px] plasmo-font-semibold plasmo-uppercase plasmo-tracking-[0.08em] plasmo-text-gray-500">
+                              Technical Diagnostics
+                            </summary>
+                            <div className="plasmo-mt-2 plasmo-grid plasmo-grid-cols-2 plasmo-gap-x-3 plasmo-gap-y-1">
+                              {technicalItems.map((item) => (
+                                <div key={item.label} className="plasmo-text-xs">
+                                  <span className="plasmo-text-gray-500">{item.label}:</span>{" "}
+                                  <span className="plasmo-font-medium plasmo-text-gray-700">{item.value}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </details>
+                        )}
+                      </div>
+                    )
+                  })()
                 )}
               </div>
             </div>

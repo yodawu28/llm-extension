@@ -85,6 +85,7 @@ export interface SummarizeResponse {
     retrieval_strategy?: string
     embedding_fallback_used?: boolean
     embedding_provider_forbidden?: boolean
+    retrieval_no_match_fallback_used?: boolean
     routing_note?: string
     selected_sources_summary?: string
     omitted_sources_summary?: string
@@ -135,6 +136,7 @@ export interface CritiqueResponse {
     retrieval_strategy?: string
     embedding_fallback_used?: boolean
     embedding_provider_forbidden?: boolean
+    retrieval_no_match_fallback_used?: boolean
     routing_note?: string
     selected_sources_summary?: string
     omitted_sources_summary?: string
@@ -186,6 +188,7 @@ export interface DiagramResponse {
     retrieval_strategy?: string
     embedding_fallback_used?: boolean
     embedding_provider_forbidden?: boolean
+    retrieval_no_match_fallback_used?: boolean
     routing_note?: string
     selected_sources_summary?: string
     omitted_sources_summary?: string
@@ -336,10 +339,12 @@ function resolveDefaultBaseURL() {
 class APIClient {
   private baseURL: string
   private defaultRequestTimeoutMs: number
+  private longRunningRequestTimeoutMs: number
 
   constructor(baseURL: string = resolveDefaultBaseURL()) {
     this.baseURL = normalizeBaseURL(baseURL)
-    this.defaultRequestTimeoutMs = 60000
+    this.defaultRequestTimeoutMs = 90000
+    this.longRunningRequestTimeoutMs = 120000
   }
 
   /**
@@ -460,7 +465,7 @@ class APIClient {
         "Content-Type": "application/json"
       },
       body: JSON.stringify(sanitizedRequest)
-    })
+    }, this.longRunningRequestTimeoutMs)
   }
 
   /**
@@ -488,7 +493,7 @@ class APIClient {
         "Content-Type": "application/json"
       },
       body: JSON.stringify(sanitizedRequest)
-    })
+    }, this.longRunningRequestTimeoutMs)
   }
 
   /**
@@ -522,7 +527,7 @@ class APIClient {
         "Content-Type": "application/json"
       },
       body: JSON.stringify(sanitizedRequest)
-    })
+    }, this.longRunningRequestTimeoutMs)
   }
 
   /**

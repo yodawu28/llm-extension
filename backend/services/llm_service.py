@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import re
 from typing import List, Optional, Tuple
 
@@ -11,6 +12,8 @@ from config.settings import get_settings
 from schemas.requests import Citation, CritiqueIssue, PageContent, PageSuggestion
 from services.chunking_service import Chunk
 
+logger = logging.getLogger(__name__)
+
 
 class LLMService:
     """Service for LLM-based summarization with citation support"""
@@ -18,6 +21,14 @@ class LLMService:
     def __init__(self):
         self.settings = get_settings()
         self.model = self._init_model()
+        logger.info(
+            "LLM client initialized provider=%s model=%s base_url=%s reasoning_effort=%s timeout_seconds=%s",
+            self.settings.llm_provider,
+            self.get_model_name(),
+            self.settings.resolved_openai_base_url(),
+            self.settings.openai_reasoning_effort or None,
+            self.settings.request_timeout_seconds,
+        )
 
     def _supports_custom_temperature(self, model_name: str) -> bool:
         normalized = (model_name or "").strip().lower()
@@ -37,47 +48,57 @@ class LLMService:
 
     def _init_model(self):
         """Initialize LLM based on provider setting"""
-        if self.settings.llm_provider == "openai":
-            api_key = self.settings.resolved_openai_api_key()
-            if not api_key:
-                raise ValueError("OpenAI API key or PAT token not found in settings")
+        try:
+            if self.settings.llm_provider == "openai":
+                api_key = self.settings.resolved_openai_api_key()
+                if not api_key:
+                    raise ValueError("OpenAI API key or PAT token not found in settings")
 
-            init_kwargs = dict(
-                api_key=api_key,
-                model=self.settings.openai_model,
-                base_url=self.settings.resolved_openai_base_url(),
-                max_tokens=self.settings.max_output_tokens,
-                timeout=self.settings.request_timeout_seconds,
-                max_retries=1,
-            )
+                init_kwargs = dict(
+                    api_key=api_key,
+                    model=self.settings.openai_model,
+                    base_url=self.settings.resolved_openai_base_url(),
+                    max_tokens=self.settings.max_output_tokens,
+                    timeout=self.settings.request_timeout_seconds,
+                    max_retries=1,
+                )
 
-            if self._supports_custom_temperature(self.settings.openai_model):
-                init_kwargs["temperature"] = 0.3
-            else:
-                # LangChain defaults ChatOpenAI.temperature to 0.7. Reasoning models
-                # like o4-mini only accept the provider default temperature of 1.
-                init_kwargs["temperature"] = 1
+                if self._supports_custom_temperature(self.settings.openai_model):
+                    init_kwargs["temperature"] = 0.3
+                else:
+                    # LangChain defaults ChatOpenAI.temperature to 0.7. Reasoning models
+                    # like o4-mini only accept the provider default temperature of 1.
+                    init_kwargs["temperature"] = 1
 
-            if self.settings.openai_reasoning_effort:
-                init_kwargs["reasoning_effort"] = self.settings.openai_reasoning_effort
+                if self.settings.openai_reasoning_effort:
+                    init_kwargs["reasoning_effort"] = self.settings.openai_reasoning_effort
 
-            return ChatOpenAI(**init_kwargs)
+                return ChatOpenAI(**init_kwargs)
 
-        elif self.settings.llm_provider == "anthropic":
-            if not self.settings.anthropic_api_key:
-                raise ValueError("Anthropic API key not found in settings")
+            if self.settings.llm_provider == "anthropic":
+                if not self.settings.anthropic_api_key:
+                    raise ValueError("Anthropic API key not found in settings")
 
-            return ChatAnthropic(
-                api_key=self.settings.anthropic_api_key,
-                model=self.settings.anthropic_model,
-                temperature=0.3,
-                max_tokens=self.settings.max_output_tokens,
-                timeout=self.settings.request_timeout_seconds,
-                max_retries=1,
-            )
+                return ChatAnthropic(
+                    api_key=self.settings.anthropic_api_key,
+                    model=self.settings.anthropic_model,
+                    temperature=0.3,
+                    max_tokens=self.settings.max_output_tokens,
+                    timeout=self.settings.request_timeout_seconds,
+                    max_retries=1,
+                )
 
-        else:
             raise ValueError(f"Unknown LLM provider: {self.settings.llm_provider}")
+        except Exception:
+            logger.exception(
+                "Failed to initialize LLM client provider=%s model=%s base_url=%s has_pat_token=%s has_openai_api_key=%s",
+                self.settings.llm_provider,
+                self.settings.openai_model if self.settings.llm_provider == "openai" else self.settings.anthropic_model,
+                self.settings.resolved_openai_base_url(),
+                bool(self.settings.pat_token),
+                bool(self.settings.openai_api_key),
+            )
+            raise
 
     def _build_system_prompt(self) -> str:
         """Build system prompt for summarization with context awareness"""
@@ -462,9 +483,22 @@ Rules:
                 timeout=self.settings.request_timeout_seconds
             )
         except asyncio.TimeoutError as exc:
+            logger.error(
+                "LLM request timed out provider=%s model=%s timeout_seconds=%s",
+                self.settings.llm_provider,
+                self.get_model_name(),
+                self.settings.request_timeout_seconds,
+            )
             raise TimeoutError(
                 f"LLM request timed out after {self.settings.request_timeout_seconds} seconds"
             ) from exc
+        except Exception:
+            logger.exception(
+                "LLM invocation failed provider=%s model=%s",
+                self.settings.llm_provider,
+                self.get_model_name(),
+            )
+            raise
 
     async def summarize(
         self, pages: List[PageContent], user_question: str = None

@@ -1,3 +1,4 @@
+import logging
 import re
 from dataclasses import dataclass
 from functools import lru_cache
@@ -27,6 +28,7 @@ from services.vector_store import VectorStore
 from services.token_counter import TokenCounter
 
 router = APIRouter(prefix="/api", tags=["summarization"])
+logger = logging.getLogger(__name__)
 
 QUERY_STOP_WORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "do", "does", "for", "from",
@@ -114,9 +116,17 @@ def _format_profile_label(profile: PageProfile) -> str:
     return f"{_shorten_text(profile.page.title, 48)} [{profile.role}/{profile.page.source_type}]"
 
 
+def _question_excerpt(user_question: str | None, limit: int = 120) -> str:
+    return _shorten_text(user_question or "", limit) or "-"
+
+
 def get_llm_service() -> LLMService:
     """Dependency injection for LLM service"""
-    return LLMService()
+    try:
+        return LLMService()
+    except Exception:
+        logger.exception("Failed to create LLM service dependency.")
+        raise
 
 
 def get_chunking_service() -> ChunkingService:
@@ -124,15 +134,26 @@ def get_chunking_service() -> ChunkingService:
     return ChunkingService(chunk_size=1000, chunk_overlap=200)
 
 
+@lru_cache
 def get_embedding_service() -> EmbeddingService:
     """Dependency injection for embedding service"""
     settings = get_settings()
-    return EmbeddingService(settings)
+    try:
+        return EmbeddingService(settings)
+    except Exception:
+        logger.exception(
+            "Failed to create embedding service dependency provider=%s model=%s base_url=%s",
+            settings.embedding_provider,
+            settings.resolved_embedding_model(),
+            settings.resolved_openai_base_url(),
+        )
+        raise
 
 
 def get_vector_store() -> VectorStore:
     """Dependency injection for vector store"""
-    return VectorStore(embedding_dimension=1536)
+    settings = get_settings()
+    return VectorStore(embedding_dimension=settings.resolved_embedding_dimensions())
 
 
 @lru_cache
@@ -332,10 +353,15 @@ def _build_selection_summaries(
     page_profiles: dict[str, PageProfile]
 ) -> dict[str, str]:
     selected_page_urls = {chunk.metadata.page_url for chunk in retrieved_chunks}
+    selected_page_order: list[str] = []
     selected_labels: list[str] = []
     omitted_labels: list[str] = []
 
-    for page_url in selected_page_urls:
+    for chunk in retrieved_chunks:
+        if chunk.metadata.page_url not in selected_page_order:
+            selected_page_order.append(chunk.metadata.page_url)
+
+    for page_url in selected_page_order:
         profile = page_profiles.get(page_url)
         if profile:
             selected_labels.append(_format_profile_label(profile))
@@ -357,7 +383,7 @@ def _build_selection_summaries(
             break
 
     return {
-        "selected_sources_summary": "; ".join(sorted(selected_labels)[:4]) if selected_labels else "",
+        "selected_sources_summary": "; ".join(selected_labels[:4]) if selected_labels else "",
         "omitted_sources_summary": "; ".join(omitted_labels) if omitted_labels else "",
     }
 
@@ -457,6 +483,39 @@ def _lexical_search_chunks(
 
     scored_results.sort(key=lambda item: item[1], reverse=True)
     return scored_results[:top_k]
+
+
+def _priority_fallback_chunks(
+    chunks: list,
+    page_profiles: dict[str, PageProfile],
+    top_k: int
+) -> list[tuple]:
+    chunk_lookup: dict[str, list] = {}
+
+    for chunk in chunks:
+        chunk_lookup.setdefault(chunk.metadata.page_url, []).append(chunk)
+
+    ranked_profiles = sorted(
+        page_profiles.values(),
+        key=lambda profile: (profile.priority, profile.title_overlap, profile.heading_overlap),
+        reverse=True,
+    )
+
+    fallback_results: list[tuple] = []
+    seen_chunk_keys = set()
+
+    for profile in ranked_profiles:
+        page_chunks = chunk_lookup.get(profile.page.url, [])
+        for chunk in page_chunks[:2]:
+            chunk_key = _chunk_key(chunk)
+            if chunk_key in seen_chunk_keys:
+                continue
+            seen_chunk_keys.add(chunk_key)
+            fallback_results.append((chunk, max(0.12, profile.priority * 0.1)))
+            if len(fallback_results) >= top_k:
+                return fallback_results
+
+    return fallback_results
 
 
 def _is_forbidden_provider_error(exc: str | Exception) -> bool:
@@ -700,6 +759,11 @@ async def retrieve_relevant_chunks(
             embedding_fallback_used = True
             embedding_fallback_reason = str(exc)
             embeddings = []
+            logger.warning(
+                "Chunk embedding failed; falling back to lexical retrieval mode=%s reason=%s",
+                retrieval_mode,
+                _shorten_text(str(exc), 220),
+            )
 
         retrieval_cache.set_corpus(
             corpus_signature,
@@ -714,6 +778,7 @@ async def retrieve_relevant_chunks(
     top_k_candidates = min(20, len(chunks))
     query_embedding = None
     query_embedding_cache_hit = False
+    no_match_fallback_used = False
 
     if embeddings_available:
         vector_store.add_chunks(chunks, embeddings)
@@ -728,6 +793,11 @@ async def retrieve_relevant_chunks(
                 embedding_fallback_used = True
                 embedding_fallback_reason = str(exc)
                 question_embedding = None
+                logger.warning(
+                    "Question embedding failed; falling back to lexical retrieval mode=%s reason=%s",
+                    retrieval_mode,
+                    _shorten_text(str(exc), 220),
+                )
 
     if embeddings_available and question_embedding is not None:
         candidate_results = vector_store.search(question_embedding, top_k=top_k_candidates)
@@ -740,9 +810,22 @@ async def retrieve_relevant_chunks(
         )
 
     if not candidate_results:
+        no_match_fallback_used = True
+        logger.info(
+            "No retrieval candidates matched question; using priority fallback mode=%s question=%s",
+            retrieval_mode,
+            _question_excerpt(request.user_question),
+        )
+        candidate_results = _priority_fallback_chunks(
+            chunks,
+            page_profiles,
+            top_k_candidates
+        )
+
+    if not candidate_results:
         raise HTTPException(
             status_code=400,
-            detail="No relevant content found for the question"
+            detail="Pinned pages do not contain enough overlapping context for this question"
         )
 
     reranked_results = _rerank_candidates(request.user_question, candidate_results)
@@ -751,6 +834,19 @@ async def retrieve_relevant_chunks(
         reranked_results
     )
     reranked_results = _apply_page_quality_scores(reranked_results, page_profiles)
+
+    if not reranked_results:
+        no_match_fallback_used = True
+        logger.info(
+            "Reranker removed all candidates; using priority fallback mode=%s question=%s",
+            retrieval_mode,
+            _question_excerpt(request.user_question),
+        )
+        reranked_results = _priority_fallback_chunks(
+            chunks,
+            page_profiles,
+            top_k_candidates
+        )
 
     min_similarity = 0.22
     filtered_results = [
@@ -763,11 +859,30 @@ async def retrieve_relevant_chunks(
         fallback_count = min(5, len(reranked_results))
         filtered_results = reranked_results[:fallback_count]
         similarity_fallback_used = bool(filtered_results)
+        if similarity_fallback_used:
+            logger.info(
+                "Similarity threshold removed all chunks; using top reranked chunks mode=%s threshold=%.2f",
+                retrieval_mode,
+                min_similarity,
+            )
+
+    if not filtered_results:
+        no_match_fallback_used = True
+        logger.info(
+            "Similarity fallback still empty; using priority fallback mode=%s question=%s",
+            retrieval_mode,
+            _question_excerpt(request.user_question),
+        )
+        filtered_results = _priority_fallback_chunks(
+            chunks,
+            page_profiles,
+            top_k_candidates
+        )
 
     if not filtered_results:
         raise HTTPException(
             status_code=400,
-            detail="No relevant content found for the question"
+            detail="Pinned pages do not contain enough usable context for this question"
         )
 
     page_chunk_caps = _build_page_chunk_caps(page_profiles)
@@ -821,10 +936,25 @@ async def retrieve_relevant_chunks(
         "retrieval_strategy": "dense+hybrid" if embeddings_available and question_embedding is not None else "lexical-fallback",
         "embedding_fallback_used": embedding_fallback_used,
         "embedding_provider_forbidden": _is_forbidden_provider_error(embedding_fallback_reason) if embedding_fallback_reason else False,
+        "retrieval_no_match_fallback_used": no_match_fallback_used,
     }
     retrieval_stats.update(context_page_stats)
     retrieval_stats.update(selection_summaries)
     retrieval_stats.update(reranker_stats)
+    logger.info(
+        "Retrieval completed mode=%s input_pages=%s prepared_pages=%s chunks=%s retrieved_chunks=%s strategy=%s deduped_pages=%s corpus_cache_hit=%s query_embedding_cache_hit=%s embedding_fallback_used=%s no_match_fallback_used=%s",
+        retrieval_mode,
+        context_page_stats["input_pages"],
+        context_page_stats["prepared_pages"],
+        chunk_stats.get("total_chunks", len(chunks)),
+        len(retrieved_chunks),
+        retrieval_stats["retrieval_strategy"],
+        context_page_stats["deduped_pages"],
+        corpus_cache_hit,
+        query_embedding_cache_hit,
+        embedding_fallback_used,
+        no_match_fallback_used,
+    )
 
     return retrieved_chunks, retrieval_stats
 
@@ -844,6 +974,11 @@ async def summarize_pages(
     try:
         settings = get_settings()
         prepared_pages = _prepare_pages(request.pages)
+        logger.info(
+            "Handling /api/summarize pages=%s question=%s",
+            len(prepared_pages),
+            _question_excerpt(request.user_question),
+        )
         if not prepared_pages:
             raise HTTPException(
                 status_code=400,
@@ -876,11 +1011,20 @@ async def summarize_pages(
             model_used=llm_service.get_model_name(),
         )
 
-    except HTTPException:
+    except HTTPException as exc:
+        log_method = logger.error if exc.status_code >= 500 else logger.warning
+        log_method("Request failed path=/api/summarize status=%s detail=%s", exc.status_code, exc.detail)
         raise
     except ValueError as e:
+        logger.warning("Request validation failed path=/api/summarize detail=%s", str(e))
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        logger.exception(
+            "Unexpected summarize error model=%s pages=%s question=%s",
+            llm_service.get_model_name(),
+            len(prepared_pages),
+            _question_excerpt(request.user_question),
+        )
         _raise_provider_http_error_if_needed(
             stage="chat",
             model_name=llm_service.get_model_name(),
@@ -919,6 +1063,11 @@ async def rag_summarize_pages(
     try:
         settings = get_settings()
         prepared_pages = _prepare_pages(request.pages)
+        logger.info(
+            "Handling /api/rag-summarize pages=%s question=%s",
+            len(prepared_pages),
+            _question_excerpt(request.user_question),
+        )
         if not prepared_pages:
             raise HTTPException(
                 status_code=400,
@@ -973,11 +1122,20 @@ async def rag_summarize_pages(
             suggestions=suggestions
         )
 
-    except HTTPException:
+    except HTTPException as exc:
+        log_method = logger.error if exc.status_code >= 500 else logger.warning
+        log_method("Request failed path=/api/rag-summarize status=%s detail=%s", exc.status_code, exc.detail)
         raise
     except ValueError as e:
+        logger.warning("Request validation failed path=/api/rag-summarize detail=%s", str(e))
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        logger.exception(
+            "Unexpected RAG summarize error model=%s pages=%s question=%s",
+            llm_service.get_model_name(),
+            len(prepared_pages),
+            _question_excerpt(request.user_question),
+        )
         _raise_provider_http_error_if_needed(
             stage="chat",
             model_name=llm_service.get_model_name(),
@@ -1007,6 +1165,11 @@ async def critique_pages(
     try:
         settings = get_settings()
         prepared_pages = _prepare_pages(request.pages)
+        logger.info(
+            "Handling /api/critique pages=%s question=%s",
+            len(prepared_pages),
+            _question_excerpt(request.user_question),
+        )
         if not prepared_pages:
             raise HTTPException(
                 status_code=400,
@@ -1053,11 +1216,20 @@ async def critique_pages(
             model_used=llm_service.get_model_name(),
         )
 
-    except HTTPException:
+    except HTTPException as exc:
+        log_method = logger.error if exc.status_code >= 500 else logger.warning
+        log_method("Request failed path=/api/critique status=%s detail=%s", exc.status_code, exc.detail)
         raise
     except ValueError as e:
+        logger.warning("Request validation failed path=/api/critique detail=%s", str(e))
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        logger.exception(
+            "Unexpected critique error model=%s pages=%s question=%s",
+            llm_service.get_model_name(),
+            len(prepared_pages),
+            _question_excerpt(request.user_question),
+        )
         _raise_provider_http_error_if_needed(
             stage="chat",
             model_name=llm_service.get_model_name(),
@@ -1088,6 +1260,12 @@ async def generate_diagram(
     try:
         settings = get_settings()
         prepared_pages = _prepare_pages(request.pages)
+        logger.info(
+            "Handling /api/generate-diagram pages=%s question=%s diagram_type=%s",
+            len(prepared_pages),
+            _question_excerpt(request.user_question),
+            request.diagram_type,
+        )
         if not prepared_pages:
             raise HTTPException(
                 status_code=400,
@@ -1141,11 +1319,21 @@ async def generate_diagram(
             model_used=llm_service.get_model_name(),
         )
 
-    except HTTPException:
+    except HTTPException as exc:
+        log_method = logger.error if exc.status_code >= 500 else logger.warning
+        log_method("Request failed path=/api/generate-diagram status=%s detail=%s", exc.status_code, exc.detail)
         raise
     except ValueError as e:
+        logger.warning("Request validation failed path=/api/generate-diagram detail=%s", str(e))
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        logger.exception(
+            "Unexpected diagram error model=%s pages=%s question=%s diagram_type=%s",
+            llm_service.get_model_name(),
+            len(prepared_pages),
+            _question_excerpt(request.user_question),
+            request.diagram_type,
+        )
         _raise_provider_http_error_if_needed(
             stage="chat",
             model_name=llm_service.get_model_name(),

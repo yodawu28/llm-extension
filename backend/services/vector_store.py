@@ -1,11 +1,6 @@
-"""
-Vector Store Service - Store and retrieve embeddings using FAISS
-In-memory vector database for fast similarity search
-"""
-
-from typing import List, Tuple, Optional
-import numpy as np
 import faiss
+import numpy as np
+from typing import List, Optional, Tuple
 
 from services.chunking_service import Chunk
 
@@ -47,6 +42,14 @@ class VectorStore:
 
         # Convert embeddings to numpy array with float32 (FAISS requirement)
         embeddings_array = np.array(embeddings, dtype=np.float32)
+        if embeddings_array.ndim != 2:
+            raise ValueError("Embeddings must be a 2D matrix")
+
+        if embeddings_array.shape[1] != self.dimension:
+            raise ValueError(
+                f"Embedding dimension mismatch: expected {self.dimension}, got {embeddings_array.shape[1]}"
+            )
+
         faiss.normalize_L2(embeddings_array)
 
         # Add to FAISS index
@@ -79,6 +82,10 @@ class VectorStore:
 
         # Convert query to numpy array
         query_array = np.array([query_embedding], dtype=np.float32)
+        if query_array.shape[1] != self.dimension:
+            raise ValueError(
+                f"Query embedding dimension mismatch: expected {self.dimension}, got {query_array.shape[1]}"
+            )
 
         faiss.normalize_L2(query_array)
 

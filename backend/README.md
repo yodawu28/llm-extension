@@ -55,6 +55,7 @@ AWS_GATEWAY_URL=https://genai-gateway.flava-cloud.com/
 PAT_TOKEN=your-internal-pat
 OPENAI_MODEL=gpt-4o
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+REQUEST_TIMEOUT_SECONDS=120
 ```
 
 ### 4. Run Server
@@ -66,6 +67,36 @@ uvicorn main:app --reload --host 127.0.0.1 --port 8000
 Server will start at: **http://localhost:8000**
 
 API Documentation: **http://localhost:8000/docs**
+
+## Docker
+
+Build and run the backend from the repo root:
+
+```bash
+cp ../.env.compose.example ../.env.compose
+cp .env.example .env
+docker compose --env-file ../.env.compose up --build -d backend
+```
+
+This uses [backend/Dockerfile](/Users/long.vo/workspaces/personal/side-projects/llm-extensions/backend/Dockerfile) and loads environment variables from `backend/.env`.
+
+Notes:
+- The container exposes port `8000`
+- The image installs both base backend dependencies and optional local embedding/reranker dependencies
+- `EMBEDDING_PROVIDER=local` is supported inside Docker too
+- The compose stack includes a backend healthcheck and an optional smoke-check service
+
+Smoke check:
+
+```bash
+docker compose --env-file ../.env.compose --profile check up backend-smoke
+```
+
+Validate env before startup:
+
+```bash
+node ../scripts/check-env.mjs .env
+```
 
 ## API Endpoints
 

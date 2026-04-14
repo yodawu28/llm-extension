@@ -1,4 +1,4 @@
-# Optional cross-encoder reranker dependencies
+# Optional cross-encoder reranker and local embedding dependencies
 # Install only if you want to enable:
 #   RERANKER_ENABLED=true
 sentence-transformers==3.4.1
