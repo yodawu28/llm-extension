@@ -49,9 +49,19 @@ export interface CritiqueIssue {
   source_title?: string
 }
 
+export interface SourceConflict {
+  topic: string
+  summary: string
+  source_a_title: string
+  source_a_evidence: string
+  source_b_title: string
+  source_b_evidence: string
+}
+
 export interface SummarizeResponse {
   summary: string
   citations: Citation[]
+  source_conflicts?: SourceConflict[]
   suggestions?: PageSuggestion[]
   token_usage: {
     input_tokens: number
@@ -71,6 +81,10 @@ export interface SummarizeResponse {
     selected_chunk_tokens?: number
     selected_pages?: number
     adjacent_chunks_added?: number
+    stitched_chunks_added?: number
+    stitched_bridge_chunks_added?: number
+    stitching_applied?: boolean
+    stitching_mode?: string
     reranker_used?: boolean
     reranker_model?: string
     reranker_candidates?: number
@@ -81,11 +95,50 @@ export interface SummarizeResponse {
     deduped_by_content?: number
     high_priority_pages?: number
     retrieval_mode?: string
+    planner_mode?: string
+    planner_note?: string
     context_budget_tokens?: number
+    context_budget_policy?: string
+    context_budget_chunk_cap?: number
+    context_budget_candidate_cap?: number
+    context_budget_page_cap?: number
+    context_budget_model_route?: string
+    context_budget_target_model?: string
+    retrieval_latency_ms?: number
+    generation_latency_ms?: number
+    end_to_end_latency_ms?: number
+    ttft_ms?: number
+    timing_source?: string
+    provider_total_latency_ms?: number
+    provider_load_latency_ms?: number
+    provider_prompt_eval_latency_ms?: number
+    provider_eval_latency_ms?: number
     retrieval_strategy?: string
+    provider_used?: string
+    provider_mode?: string
+    model_used?: string
+    model_route?: string
+    model_fallback_used?: boolean
+    model_routing_note?: string
+    hybrid_prefilter_applied?: boolean
+    hybrid_prefilter_fallback_used?: boolean
+    hybrid_prefilter_provider?: string
+    hybrid_prefilter_model?: string
+    hybrid_prefilter_input_chunks?: number
+    hybrid_prefilter_output_chunks?: number
+    hybrid_prefilter_reduced_chunks?: number
+    hybrid_prefilter_context_tokens?: number
+    hybrid_prefilter_latency_ms?: number
+    hybrid_prefilter_reason?: string
+    low_confidence?: boolean
+    confidence_level?: string
+    confidence_note?: string
+    confidence_next_step?: string
     embedding_fallback_used?: boolean
     embedding_provider_forbidden?: boolean
     retrieval_no_match_fallback_used?: boolean
+    source_type_diversity_caps_applied?: boolean
+    source_diversity_summary?: string
     routing_note?: string
     selected_sources_summary?: string
     omitted_sources_summary?: string
@@ -103,6 +156,7 @@ export interface CritiqueResponse {
   summary: string
   issues: CritiqueIssue[]
   citations: Citation[]
+  source_conflicts?: SourceConflict[]
   token_usage: {
     input_tokens: number
     output_tokens: number
@@ -121,6 +175,10 @@ export interface CritiqueResponse {
     selected_chunk_tokens?: number
     selected_pages?: number
     adjacent_chunks_added?: number
+    stitched_chunks_added?: number
+    stitched_bridge_chunks_added?: number
+    stitching_applied?: boolean
+    stitching_mode?: string
     reranker_used?: boolean
     reranker_model?: string
     reranker_candidates?: number
@@ -132,11 +190,50 @@ export interface CritiqueResponse {
     deduped_by_content?: number
     high_priority_pages?: number
     retrieval_mode?: string
+    planner_mode?: string
+    planner_note?: string
     context_budget_tokens?: number
+    context_budget_policy?: string
+    context_budget_chunk_cap?: number
+    context_budget_candidate_cap?: number
+    context_budget_page_cap?: number
+    context_budget_model_route?: string
+    context_budget_target_model?: string
+    retrieval_latency_ms?: number
+    generation_latency_ms?: number
+    end_to_end_latency_ms?: number
+    ttft_ms?: number
+    timing_source?: string
+    provider_total_latency_ms?: number
+    provider_load_latency_ms?: number
+    provider_prompt_eval_latency_ms?: number
+    provider_eval_latency_ms?: number
     retrieval_strategy?: string
+    provider_used?: string
+    provider_mode?: string
+    model_used?: string
+    model_route?: string
+    model_fallback_used?: boolean
+    model_routing_note?: string
+    hybrid_prefilter_applied?: boolean
+    hybrid_prefilter_fallback_used?: boolean
+    hybrid_prefilter_provider?: string
+    hybrid_prefilter_model?: string
+    hybrid_prefilter_input_chunks?: number
+    hybrid_prefilter_output_chunks?: number
+    hybrid_prefilter_reduced_chunks?: number
+    hybrid_prefilter_context_tokens?: number
+    hybrid_prefilter_latency_ms?: number
+    hybrid_prefilter_reason?: string
+    low_confidence?: boolean
+    confidence_level?: string
+    confidence_note?: string
+    confidence_next_step?: string
     embedding_fallback_used?: boolean
     embedding_provider_forbidden?: boolean
     retrieval_no_match_fallback_used?: boolean
+    source_type_diversity_caps_applied?: boolean
+    source_diversity_summary?: string
     routing_note?: string
     selected_sources_summary?: string
     omitted_sources_summary?: string
@@ -156,6 +253,7 @@ export interface DiagramResponse {
   is_valid: boolean
   diagram_type: string
   citations: Citation[]
+  source_conflicts?: SourceConflict[]
   token_usage: {
     input_tokens: number
     output_tokens: number
@@ -174,6 +272,10 @@ export interface DiagramResponse {
     selected_chunk_tokens?: number
     selected_pages?: number
     adjacent_chunks_added?: number
+    stitched_chunks_added?: number
+    stitched_bridge_chunks_added?: number
+    stitching_applied?: boolean
+    stitching_mode?: string
     reranker_used?: boolean
     reranker_model?: string
     reranker_candidates?: number
@@ -184,11 +286,50 @@ export interface DiagramResponse {
     deduped_by_content?: number
     high_priority_pages?: number
     retrieval_mode?: string
+    planner_mode?: string
+    planner_note?: string
     context_budget_tokens?: number
+    context_budget_policy?: string
+    context_budget_chunk_cap?: number
+    context_budget_candidate_cap?: number
+    context_budget_page_cap?: number
+    context_budget_model_route?: string
+    context_budget_target_model?: string
+    retrieval_latency_ms?: number
+    generation_latency_ms?: number
+    end_to_end_latency_ms?: number
+    ttft_ms?: number
+    timing_source?: string
+    provider_total_latency_ms?: number
+    provider_load_latency_ms?: number
+    provider_prompt_eval_latency_ms?: number
+    provider_eval_latency_ms?: number
     retrieval_strategy?: string
+    provider_used?: string
+    provider_mode?: string
+    model_used?: string
+    model_route?: string
+    model_fallback_used?: boolean
+    model_routing_note?: string
+    hybrid_prefilter_applied?: boolean
+    hybrid_prefilter_fallback_used?: boolean
+    hybrid_prefilter_provider?: string
+    hybrid_prefilter_model?: string
+    hybrid_prefilter_input_chunks?: number
+    hybrid_prefilter_output_chunks?: number
+    hybrid_prefilter_reduced_chunks?: number
+    hybrid_prefilter_context_tokens?: number
+    hybrid_prefilter_latency_ms?: number
+    hybrid_prefilter_reason?: string
+    low_confidence?: boolean
+    confidence_level?: string
+    confidence_note?: string
+    confidence_next_step?: string
     embedding_fallback_used?: boolean
     embedding_provider_forbidden?: boolean
     retrieval_no_match_fallback_used?: boolean
+    source_type_diversity_caps_applied?: boolean
+    source_diversity_summary?: string
     routing_note?: string
     selected_sources_summary?: string
     omitted_sources_summary?: string

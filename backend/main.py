@@ -53,6 +53,19 @@ async def log_startup_configuration():
     if settings.llm_provider == "openai" and not settings.resolved_openai_base_url() and settings.pat_token:
         logger.warning("PAT token is configured without an OpenAI-compatible base URL or gateway URL.")
 
+    if settings.llm_provider == "ollama" and not settings.resolved_ollama_base_url():
+        logger.warning("Ollama provider is selected but `OLLAMA_BASE_URL` is empty.")
+
+    if settings.llm_provider == "hybrid":
+        if settings.resolved_cloud_provider() == "openai" and not settings.resolved_openai_api_key():
+            logger.warning("Hybrid mode with OpenAI-compatible cloud provider requires `PAT_TOKEN` or `OPENAI_API_KEY`.")
+        if settings.resolved_cloud_provider() == "openai" and settings.pat_token and not settings.resolved_openai_base_url():
+            logger.warning("Hybrid mode with PAT token usually requires `AWS_GATEWAY_URL` or `OPENAI_BASE_URL`.")
+        if settings.resolved_cloud_provider() == "anthropic" and not settings.anthropic_api_key:
+            logger.warning("Hybrid mode with Anthropic cloud provider requires `ANTHROPIC_API_KEY`.")
+        if not settings.resolved_ollama_base_url():
+            logger.warning("Hybrid mode requires `OLLAMA_BASE_URL` for local prefilter.")
+
 
 @app.middleware("http")
 async def log_http_requests(request: Request, call_next):

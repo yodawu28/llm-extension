@@ -233,11 +233,26 @@ class CritiqueIssue(BaseModel):
     )
 
 
+class SourceConflict(BaseModel):
+    """High-confidence conflict detected across retrieved sources"""
+
+    topic: str = Field(..., description="Short conflict topic label")
+    summary: str = Field(..., description="Short summary of the contradiction")
+    source_a_title: str = Field(..., description="First source title")
+    source_a_evidence: str = Field(..., description="Supporting evidence from the first source")
+    source_b_title: str = Field(..., description="Second source title")
+    source_b_evidence: str = Field(..., description="Supporting evidence from the second source")
+
+
 class SummarizeResponse(BaseModel):
     """Response with summary and citations"""
 
     summary: str = Field(..., description="Generated summary")
     citations: List[Citation] = Field(default_factory=list, description="Sources used")
+    source_conflicts: Optional[List[SourceConflict]] = Field(
+        default=None,
+        description="Potential contradictions detected across sources"
+    )
     token_usage: dict = Field(..., description="Token usage stats")
     model_used: str = Field(..., description="LLM model identifier")
     suggestions: Optional[List[PageSuggestion]] = Field(
@@ -252,6 +267,10 @@ class CritiqueResponse(BaseModel):
     summary: str = Field(..., description="Overall review summary")
     issues: List[CritiqueIssue] = Field(default_factory=list, description="Structured critique issues")
     citations: List[Citation] = Field(default_factory=list, description="Sources used")
+    source_conflicts: Optional[List[SourceConflict]] = Field(
+        default=None,
+        description="Potential contradictions detected across sources"
+    )
     token_usage: dict = Field(..., description="Token usage stats")
     model_used: str = Field(..., description="LLM model identifier")
 
@@ -264,6 +283,10 @@ class DiagramResponse(BaseModel):
     is_valid: bool = Field(..., description="Whether Mermaid validation passed")
     diagram_type: str = Field(..., description="Detected or requested Mermaid diagram type")
     citations: List[Citation] = Field(default_factory=list, description="Sources used")
+    source_conflicts: Optional[List[SourceConflict]] = Field(
+        default=None,
+        description="Potential contradictions detected across sources"
+    )
     token_usage: dict = Field(..., description="Token usage stats")
     model_used: str = Field(..., description="LLM model identifier")
 

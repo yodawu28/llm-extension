@@ -7,6 +7,7 @@ import type {
   CritiqueResponse,
   DiagramResponse,
   PageContent as APIPageContent,
+  SourceConflict,
   SummarizeResponse
 } from "~lib/api"
 import { apiClient } from "~lib/api"
@@ -34,6 +35,11 @@ interface ChatMessage {
   role: "user" | "assistant"
   content: string
   timestamp: number
+  confidenceWarning?: {
+    title: string
+    message: string
+    nextStep?: string
+  }
   citations?: {
     page_title: string
     page_url: string
@@ -44,6 +50,7 @@ interface ChatMessage {
     keywords: string[]
     confidence: "high" | "medium" | "low"
   }[]
+  sourceConflicts?: SourceConflict[]
   critiqueIssues?: CritiqueIssue[]
   diagnostics?: {
     title: string
@@ -71,6 +78,12 @@ interface BannerToast {
 interface DiagramCacheEntry {
   cachedAt: number
   response: DiagramResponse
+}
+
+interface ConfidenceUsage {
+  low_confidence?: boolean
+  confidence_note?: string
+  confidence_next_step?: string
 }
 
 const DIAGRAM_CACHE_PREFIX = "diagram_cache_"
@@ -132,6 +145,11 @@ const TITLE_MATCH_STOP_WORDS = new Set([
 ])
 
 const USER_FACING_DIAGNOSTIC_LABELS = new Set([
+  "Confidence",
+  "Next step",
+  "Source conflicts",
+  "Planner mode",
+  "Planner note",
   "Context focus",
   "Selected sources",
   "Ignored pages",
@@ -227,7 +245,11 @@ function buildDiagramMessageContent(summary: string, mermaidCode: string, isVali
     parts.push("⚠️ Mermaid validation did not fully pass. The raw code is still included below for inspection.")
   }
 
-  return parts.filter(Boolean).join("\n\n")
+  const content = parts.filter(Boolean).join("\n\n")
+  return ensureVisibleAssistantContent(
+    content,
+    "The assistant returned no diagram content. Please retry this request."
+  )
 }
 
 function stripMissingInformationSection(content: string): string {
@@ -235,6 +257,25 @@ function stripMissingInformationSection(content: string): string {
     .replace(/\n?---\s*\n?💡[\s\S]*$/m, "")
     .replace(/\n?💡\s*\*\*Missing Information:\*\*[\s\S]*$/m, "")
     .trim()
+}
+
+function ensureVisibleAssistantContent(content: string, fallbackMessage: string): string {
+  const normalized = content.trim()
+  return normalized || fallbackMessage
+}
+
+function buildConfidenceWarning(usage?: ConfidenceUsage): ChatMessage["confidenceWarning"] | undefined {
+  if (!usage?.low_confidence) {
+    return undefined
+  }
+
+  return {
+    title: "Answer may be incomplete",
+    message:
+      usage.confidence_note ||
+      "The current context looked weak, so this answer may miss important details.",
+    nextStep: usage.confidence_next_step
+  }
 }
 
 function extractSuggestionTerms(
@@ -386,7 +427,10 @@ function buildRagDiagnostics(response: SummarizeResponse): ChatMessage["diagnost
       { label: "Filtered", value: String(usage.filtered_by_similarity || 0) },
       { label: "Retrieved", value: String(usage.retrieved_chunks || 0) },
       { label: "Selected pages", value: String(usage.selected_pages || 0) },
-      { label: "Adjacent added", value: String(usage.adjacent_chunks_added || 0) },
+      {
+        label: "Stitched added",
+        value: String(usage.stitched_chunks_added ?? usage.adjacent_chunks_added ?? 0)
+      },
       { label: "Reranker", value: usage.reranker_used ? "cross-encoder" : "hybrid only" },
       { label: "Selected tokens", value: usage.selected_chunk_tokens?.toLocaleString() || "0" },
       { label: "Avg similarity", value: `${((usage.avg_similarity || 0) * 100).toFixed(1)}%` },
@@ -408,10 +452,66 @@ function buildRagDiagnostics(response: SummarizeResponse): ChatMessage["diagnost
     })
   }
 
+  if (usage.planner_mode) {
+    items.push({
+      label: "Planner mode",
+      value: usage.planner_mode
+    })
+  }
+
+  if (usage.planner_note) {
+    items.push({
+      label: "Planner note",
+      value: usage.planner_note
+    })
+  }
+
   if (usage.retrieval_strategy) {
     items.push({
       label: "Retrieval",
       value: usage.retrieval_strategy
+    })
+  }
+
+  if (usage.provider_used) {
+    items.push({
+      label: "Provider",
+      value: usage.provider_used
+    })
+  }
+
+  if (usage.provider_mode && usage.provider_mode !== usage.provider_used) {
+    items.push({
+      label: "Provider mode",
+      value: usage.provider_mode
+    })
+  }
+
+  if (usage.model_used || response.model_used) {
+    items.push({
+      label: "Model",
+      value: usage.model_used || response.model_used
+    })
+  }
+
+  if (usage.model_route) {
+    items.push({
+      label: "Model route",
+      value: usage.model_route
+    })
+  }
+
+  if (usage.model_fallback_used) {
+    items.push({
+      label: "Model fallback",
+      value: "used"
+    })
+  }
+
+  if (usage.model_routing_note) {
+    items.push({
+      label: "Model routing",
+      value: usage.model_routing_note
     })
   }
 
@@ -433,6 +533,162 @@ function buildRagDiagnostics(response: SummarizeResponse): ChatMessage["diagnost
     items.push({
       label: "Context budget",
       value: usage.context_budget_tokens.toLocaleString()
+    })
+  }
+
+  if (typeof usage.retrieval_latency_ms === "number") {
+    items.push({
+      label: "Retrieval time",
+      value: `${usage.retrieval_latency_ms} ms`
+    })
+  }
+
+  if (typeof usage.generation_latency_ms === "number") {
+    items.push({
+      label: "Generation time",
+      value: `${usage.generation_latency_ms} ms`
+    })
+  }
+
+  if (typeof usage.ttft_ms === "number") {
+    items.push({
+      label: "TTFT",
+      value: `${usage.ttft_ms} ms`
+    })
+  }
+
+  if (typeof usage.end_to_end_latency_ms === "number") {
+    items.push({
+      label: "End-to-end",
+      value: `${usage.end_to_end_latency_ms} ms`
+    })
+  }
+
+  if (usage.timing_source) {
+    items.push({
+      label: "Timing source",
+      value: usage.timing_source
+    })
+  }
+
+  if (usage.context_budget_policy) {
+    items.push({
+      label: "Budget policy",
+      value: usage.context_budget_policy
+    })
+  }
+
+  if (usage.hybrid_prefilter_applied || usage.hybrid_prefilter_fallback_used) {
+    items.push({
+      label: "Hybrid prefilter",
+      value: usage.hybrid_prefilter_applied ? "applied" : "fallback"
+    })
+  }
+
+  if (usage.hybrid_prefilter_model) {
+    items.push({
+      label: "Prefilter model",
+      value: usage.hybrid_prefilter_model
+    })
+  }
+
+  if (typeof usage.hybrid_prefilter_output_chunks === "number") {
+    items.push({
+      label: "Prefilter chunks",
+      value:
+        typeof usage.hybrid_prefilter_input_chunks === "number"
+          ? `${usage.hybrid_prefilter_output_chunks}/${usage.hybrid_prefilter_input_chunks}`
+          : String(usage.hybrid_prefilter_output_chunks)
+    })
+  }
+
+  if (typeof usage.hybrid_prefilter_context_tokens === "number") {
+    items.push({
+      label: "Prefilter tokens",
+      value: usage.hybrid_prefilter_context_tokens.toLocaleString()
+    })
+  }
+
+  if (typeof usage.hybrid_prefilter_latency_ms === "number") {
+    items.push({
+      label: "Prefilter time",
+      value: `${usage.hybrid_prefilter_latency_ms} ms`
+    })
+  }
+
+  if (usage.hybrid_prefilter_reason) {
+    items.push({
+      label: "Prefilter note",
+      value: usage.hybrid_prefilter_reason
+    })
+  }
+
+  if (usage.context_budget_target_model) {
+    items.push({
+      label: "Target model",
+      value: usage.context_budget_target_model
+    })
+  }
+
+  if (typeof usage.context_budget_candidate_cap === "number") {
+    items.push({
+      label: "Candidate cap",
+      value: String(usage.context_budget_candidate_cap)
+    })
+  }
+
+  if (typeof usage.context_budget_chunk_cap === "number") {
+    items.push({
+      label: "Chunk cap",
+      value: String(usage.context_budget_chunk_cap)
+    })
+  }
+
+  if (typeof usage.context_budget_page_cap === "number") {
+    items.push({
+      label: "Page cap",
+      value: String(usage.context_budget_page_cap)
+    })
+  }
+
+  if (usage.source_diversity_summary) {
+    items.push({
+      label: "Source diversity",
+      value: usage.source_diversity_summary
+    })
+  }
+
+  if ((response.source_conflicts?.length || 0) > 0) {
+    items.push({
+      label: "Source conflicts",
+      value: String(response.source_conflicts?.length || 0)
+    })
+  }
+
+  if (usage.low_confidence) {
+    items.push({
+      label: "Confidence",
+      value: usage.confidence_level || "low"
+    })
+    if (usage.confidence_next_step) {
+      items.push({
+        label: "Next step",
+        value: usage.confidence_next_step
+      })
+    }
+  }
+
+  if (usage.stitching_mode) {
+    items.push({
+      label: "Stitching",
+      value: usage.stitching_mode
+    })
+  }
+
+  if (typeof usage.stitched_bridge_chunks_added === "number") {
+    items.push({
+      label: "Bridge chunks",
+      value: String(usage.stitched_bridge_chunks_added)
     })
   }
 
@@ -508,7 +764,10 @@ function buildDiagramDiagnostics(response: DiagramResponse): ChatMessage["diagno
       { label: "Filtered", value: String(usage.filtered_by_similarity || 0) },
       { label: "Retrieved", value: String(usage.retrieved_chunks || 0) },
       { label: "Selected pages", value: String(usage.selected_pages || 0) },
-      { label: "Adjacent added", value: String(usage.adjacent_chunks_added || 0) },
+      {
+        label: "Stitched added",
+        value: String(usage.stitched_chunks_added ?? usage.adjacent_chunks_added ?? 0)
+      },
       { label: "Reranker", value: usage.reranker_used ? "cross-encoder" : "hybrid only" },
       { label: "Selected tokens", value: usage.selected_chunk_tokens?.toLocaleString() || "0" },
       { label: "Avg similarity", value: `${((usage.avg_similarity || 0) * 100).toFixed(1)}%` },
@@ -530,10 +789,66 @@ function buildDiagramDiagnostics(response: DiagramResponse): ChatMessage["diagno
     })
   }
 
+  if (usage.planner_mode) {
+    items.push({
+      label: "Planner mode",
+      value: usage.planner_mode
+    })
+  }
+
+  if (usage.planner_note) {
+    items.push({
+      label: "Planner note",
+      value: usage.planner_note
+    })
+  }
+
   if (usage.retrieval_strategy) {
     items.push({
       label: "Retrieval",
       value: usage.retrieval_strategy
+    })
+  }
+
+  if (usage.provider_used) {
+    items.push({
+      label: "Provider",
+      value: usage.provider_used
+    })
+  }
+
+  if (usage.provider_mode && usage.provider_mode !== usage.provider_used) {
+    items.push({
+      label: "Provider mode",
+      value: usage.provider_mode
+    })
+  }
+
+  if (usage.model_used || response.model_used) {
+    items.push({
+      label: "Model",
+      value: usage.model_used || response.model_used
+    })
+  }
+
+  if (usage.model_route) {
+    items.push({
+      label: "Model route",
+      value: usage.model_route
+    })
+  }
+
+  if (usage.model_fallback_used) {
+    items.push({
+      label: "Model fallback",
+      value: "used"
+    })
+  }
+
+  if (usage.model_routing_note) {
+    items.push({
+      label: "Model routing",
+      value: usage.model_routing_note
     })
   }
 
@@ -555,6 +870,162 @@ function buildDiagramDiagnostics(response: DiagramResponse): ChatMessage["diagno
     items.push({
       label: "Context budget",
       value: usage.context_budget_tokens.toLocaleString()
+    })
+  }
+
+  if (typeof usage.retrieval_latency_ms === "number") {
+    items.push({
+      label: "Retrieval time",
+      value: `${usage.retrieval_latency_ms} ms`
+    })
+  }
+
+  if (typeof usage.generation_latency_ms === "number") {
+    items.push({
+      label: "Generation time",
+      value: `${usage.generation_latency_ms} ms`
+    })
+  }
+
+  if (typeof usage.ttft_ms === "number") {
+    items.push({
+      label: "TTFT",
+      value: `${usage.ttft_ms} ms`
+    })
+  }
+
+  if (typeof usage.end_to_end_latency_ms === "number") {
+    items.push({
+      label: "End-to-end",
+      value: `${usage.end_to_end_latency_ms} ms`
+    })
+  }
+
+  if (usage.timing_source) {
+    items.push({
+      label: "Timing source",
+      value: usage.timing_source
+    })
+  }
+
+  if (usage.context_budget_policy) {
+    items.push({
+      label: "Budget policy",
+      value: usage.context_budget_policy
+    })
+  }
+
+  if (usage.hybrid_prefilter_applied || usage.hybrid_prefilter_fallback_used) {
+    items.push({
+      label: "Hybrid prefilter",
+      value: usage.hybrid_prefilter_applied ? "applied" : "fallback"
+    })
+  }
+
+  if (usage.hybrid_prefilter_model) {
+    items.push({
+      label: "Prefilter model",
+      value: usage.hybrid_prefilter_model
+    })
+  }
+
+  if (typeof usage.hybrid_prefilter_output_chunks === "number") {
+    items.push({
+      label: "Prefilter chunks",
+      value:
+        typeof usage.hybrid_prefilter_input_chunks === "number"
+          ? `${usage.hybrid_prefilter_output_chunks}/${usage.hybrid_prefilter_input_chunks}`
+          : String(usage.hybrid_prefilter_output_chunks)
+    })
+  }
+
+  if (typeof usage.hybrid_prefilter_context_tokens === "number") {
+    items.push({
+      label: "Prefilter tokens",
+      value: usage.hybrid_prefilter_context_tokens.toLocaleString()
+    })
+  }
+
+  if (typeof usage.hybrid_prefilter_latency_ms === "number") {
+    items.push({
+      label: "Prefilter time",
+      value: `${usage.hybrid_prefilter_latency_ms} ms`
+    })
+  }
+
+  if (usage.hybrid_prefilter_reason) {
+    items.push({
+      label: "Prefilter note",
+      value: usage.hybrid_prefilter_reason
+    })
+  }
+
+  if (usage.context_budget_target_model) {
+    items.push({
+      label: "Target model",
+      value: usage.context_budget_target_model
+    })
+  }
+
+  if (typeof usage.context_budget_candidate_cap === "number") {
+    items.push({
+      label: "Candidate cap",
+      value: String(usage.context_budget_candidate_cap)
+    })
+  }
+
+  if (typeof usage.context_budget_chunk_cap === "number") {
+    items.push({
+      label: "Chunk cap",
+      value: String(usage.context_budget_chunk_cap)
+    })
+  }
+
+  if (typeof usage.context_budget_page_cap === "number") {
+    items.push({
+      label: "Page cap",
+      value: String(usage.context_budget_page_cap)
+    })
+  }
+
+  if (usage.source_diversity_summary) {
+    items.push({
+      label: "Source diversity",
+      value: usage.source_diversity_summary
+    })
+  }
+
+  if ((response.source_conflicts?.length || 0) > 0) {
+    items.push({
+      label: "Source conflicts",
+      value: String(response.source_conflicts?.length || 0)
+    })
+  }
+
+  if (usage.low_confidence) {
+    items.push({
+      label: "Confidence",
+      value: usage.confidence_level || "low"
+    })
+    if (usage.confidence_next_step) {
+      items.push({
+        label: "Next step",
+        value: usage.confidence_next_step
+      })
+    }
+  }
+
+  if (usage.stitching_mode) {
+    items.push({
+      label: "Stitching",
+      value: usage.stitching_mode
+    })
+  }
+
+  if (typeof usage.stitched_bridge_chunks_added === "number") {
+    items.push({
+      label: "Bridge chunks",
+      value: String(usage.stitched_bridge_chunks_added)
     })
   }
 
@@ -661,9 +1132,11 @@ function isCurrentPageScopedRequest(question: string) {
 
 function detectContextIntent(
   question: string,
-  currentPageTitle?: string
+  currentPageTitle?: string,
+  requestKind: "answer" | "critique" | "diagram" = "answer"
 ): {
   mode: "default" | "current-only" | "compare-current-vs-pinned"
+  plannerMode: string
   rewrittenQuestion?: string
 } {
   const normalized = question.trim().toLowerCase()
@@ -681,6 +1154,7 @@ function detectContextIntent(
   if (compareCurrentPage || compareWithPinned) {
     return {
       mode: "compare-current-vs-pinned",
+      plannerMode: "compare-current-vs-pinned",
       rewrittenQuestion: `Compare the current page titled "${currentTitle}" against the other pinned pages. Highlight agreements, contradictions, missing context, and the most important differences.`
     }
   }
@@ -702,12 +1176,64 @@ function detectContextIntent(
 
   if (currentOnlyPhrases.some((phrase) => normalized.includes(phrase)) || isCurrentPageScopedRequest(question)) {
     return {
-      mode: "current-only"
+      mode: "current-only",
+      plannerMode:
+        requestKind === "critique"
+          ? "current-page-critique"
+          : requestKind === "diagram"
+            ? "current-page-diagram"
+            : "current-page-summary"
     }
   }
 
   return {
-    mode: "default"
+    mode: "default",
+    plannerMode:
+      requestKind === "critique"
+        ? "critique-review"
+        : requestKind === "diagram"
+          ? "diagram-synthesis"
+          : "multi-doc-synthesis"
+  }
+}
+
+function annotatePlannerContext(
+  page: APIPageContent,
+  contextRole: "current_page" | "compare_anchor" | "reference_context",
+  plannerMode: string
+): APIPageContent {
+  return {
+    ...page,
+    metadata: {
+      ...(page.metadata || {}),
+      context_role: contextRole,
+      planner_mode_hint: plannerMode
+    }
+  }
+}
+
+function prependPlanningDiagnostics(
+  diagnostics: ChatMessage["diagnostics"],
+  plannerMode: string,
+  focusLabel: string
+): ChatMessage["diagnostics"] {
+  if (!diagnostics) {
+    return diagnostics
+  }
+
+  const nextItems = [...diagnostics.items]
+
+  if (plannerMode.trim() && !nextItems.some((item) => item.label === "Planner mode")) {
+    nextItems.unshift({ label: "Planner mode", value: plannerMode })
+  }
+
+  if (focusLabel.trim() && !nextItems.some((item) => item.label === "Context focus")) {
+    nextItems.unshift({ label: "Context focus", value: focusLabel })
+  }
+
+  return {
+    ...diagnostics,
+    items: nextItems
   }
 }
 
@@ -796,7 +1322,10 @@ function buildCritiqueDiagnostics(response: CritiqueResponse): ChatMessage["diag
       { label: "Filtered", value: String(usage.filtered_by_similarity || 0) },
       { label: "Retrieved", value: String(usage.retrieved_chunks || 0) },
       { label: "Selected pages", value: String(usage.selected_pages || 0) },
-      { label: "Adjacent added", value: String(usage.adjacent_chunks_added || 0) },
+      {
+        label: "Stitched added",
+        value: String(usage.stitched_chunks_added ?? usage.adjacent_chunks_added ?? 0)
+      },
       { label: "Reranker", value: usage.reranker_used ? "cross-encoder" : "hybrid only" },
       { label: "Selected tokens", value: usage.selected_chunk_tokens?.toLocaleString() || "0" },
       { label: "Avg similarity", value: `${((usage.avg_similarity || 0) * 100).toFixed(1)}%` },
@@ -818,10 +1347,66 @@ function buildCritiqueDiagnostics(response: CritiqueResponse): ChatMessage["diag
     })
   }
 
+  if (usage.planner_mode) {
+    items.push({
+      label: "Planner mode",
+      value: usage.planner_mode
+    })
+  }
+
+  if (usage.planner_note) {
+    items.push({
+      label: "Planner note",
+      value: usage.planner_note
+    })
+  }
+
   if (usage.retrieval_strategy) {
     items.push({
       label: "Retrieval",
       value: usage.retrieval_strategy
+    })
+  }
+
+  if (usage.provider_used) {
+    items.push({
+      label: "Provider",
+      value: usage.provider_used
+    })
+  }
+
+  if (usage.provider_mode && usage.provider_mode !== usage.provider_used) {
+    items.push({
+      label: "Provider mode",
+      value: usage.provider_mode
+    })
+  }
+
+  if (usage.model_used || response.model_used) {
+    items.push({
+      label: "Model",
+      value: usage.model_used || response.model_used
+    })
+  }
+
+  if (usage.model_route) {
+    items.push({
+      label: "Model route",
+      value: usage.model_route
+    })
+  }
+
+  if (usage.model_fallback_used) {
+    items.push({
+      label: "Model fallback",
+      value: "used"
+    })
+  }
+
+  if (usage.model_routing_note) {
+    items.push({
+      label: "Model routing",
+      value: usage.model_routing_note
     })
   }
 
@@ -843,6 +1428,162 @@ function buildCritiqueDiagnostics(response: CritiqueResponse): ChatMessage["diag
     items.push({
       label: "Context budget",
       value: usage.context_budget_tokens.toLocaleString()
+    })
+  }
+
+  if (typeof usage.retrieval_latency_ms === "number") {
+    items.push({
+      label: "Retrieval time",
+      value: `${usage.retrieval_latency_ms} ms`
+    })
+  }
+
+  if (typeof usage.generation_latency_ms === "number") {
+    items.push({
+      label: "Generation time",
+      value: `${usage.generation_latency_ms} ms`
+    })
+  }
+
+  if (typeof usage.ttft_ms === "number") {
+    items.push({
+      label: "TTFT",
+      value: `${usage.ttft_ms} ms`
+    })
+  }
+
+  if (typeof usage.end_to_end_latency_ms === "number") {
+    items.push({
+      label: "End-to-end",
+      value: `${usage.end_to_end_latency_ms} ms`
+    })
+  }
+
+  if (usage.timing_source) {
+    items.push({
+      label: "Timing source",
+      value: usage.timing_source
+    })
+  }
+
+  if (usage.context_budget_policy) {
+    items.push({
+      label: "Budget policy",
+      value: usage.context_budget_policy
+    })
+  }
+
+  if (usage.hybrid_prefilter_applied || usage.hybrid_prefilter_fallback_used) {
+    items.push({
+      label: "Hybrid prefilter",
+      value: usage.hybrid_prefilter_applied ? "applied" : "fallback"
+    })
+  }
+
+  if (usage.hybrid_prefilter_model) {
+    items.push({
+      label: "Prefilter model",
+      value: usage.hybrid_prefilter_model
+    })
+  }
+
+  if (typeof usage.hybrid_prefilter_output_chunks === "number") {
+    items.push({
+      label: "Prefilter chunks",
+      value:
+        typeof usage.hybrid_prefilter_input_chunks === "number"
+          ? `${usage.hybrid_prefilter_output_chunks}/${usage.hybrid_prefilter_input_chunks}`
+          : String(usage.hybrid_prefilter_output_chunks)
+    })
+  }
+
+  if (typeof usage.hybrid_prefilter_context_tokens === "number") {
+    items.push({
+      label: "Prefilter tokens",
+      value: usage.hybrid_prefilter_context_tokens.toLocaleString()
+    })
+  }
+
+  if (typeof usage.hybrid_prefilter_latency_ms === "number") {
+    items.push({
+      label: "Prefilter time",
+      value: `${usage.hybrid_prefilter_latency_ms} ms`
+    })
+  }
+
+  if (usage.hybrid_prefilter_reason) {
+    items.push({
+      label: "Prefilter note",
+      value: usage.hybrid_prefilter_reason
+    })
+  }
+
+  if (usage.context_budget_target_model) {
+    items.push({
+      label: "Target model",
+      value: usage.context_budget_target_model
+    })
+  }
+
+  if (typeof usage.context_budget_candidate_cap === "number") {
+    items.push({
+      label: "Candidate cap",
+      value: String(usage.context_budget_candidate_cap)
+    })
+  }
+
+  if (typeof usage.context_budget_chunk_cap === "number") {
+    items.push({
+      label: "Chunk cap",
+      value: String(usage.context_budget_chunk_cap)
+    })
+  }
+
+  if (typeof usage.context_budget_page_cap === "number") {
+    items.push({
+      label: "Page cap",
+      value: String(usage.context_budget_page_cap)
+    })
+  }
+
+  if (usage.source_diversity_summary) {
+    items.push({
+      label: "Source diversity",
+      value: usage.source_diversity_summary
+    })
+  }
+
+  if ((response.source_conflicts?.length || 0) > 0) {
+    items.push({
+      label: "Source conflicts",
+      value: String(response.source_conflicts?.length || 0)
+    })
+  }
+
+  if (usage.low_confidence) {
+    items.push({
+      label: "Confidence",
+      value: usage.confidence_level || "low"
+    })
+    if (usage.confidence_next_step) {
+      items.push({
+        label: "Next step",
+        value: usage.confidence_next_step
+      })
+    }
+  }
+
+  if (usage.stitching_mode) {
+    items.push({
+      label: "Stitching",
+      value: usage.stitching_mode
+    })
+  }
+
+  if (typeof usage.stitched_bridge_chunks_added === "number") {
+    items.push({
+      label: "Bridge chunks",
+      value: String(usage.stitched_bridge_chunks_added)
     })
   }
 
@@ -1595,9 +2336,11 @@ function SidePanel() {
       } else {
         const diagramMode = isDiagramRequest(userQuestion)
         const critiqueMode = !diagramMode && isCritiqueRequest(userQuestion)
-        const contextIntent = detectContextIntent(userQuestion, currentPage?.title)
+        const requestKind = diagramMode ? "diagram" : critiqueMode ? "critique" : "answer"
+        const contextIntent = detectContextIntent(userQuestion, currentPage?.title, requestKind)
         let diagramCacheKey: string | null = null
         let contextFocusLabel: string | null = null
+        let plannerModeLabel = contextIntent.plannerMode
         let effectiveUserQuestion = userQuestion
 
         // Real API mode: Call backend with Phase 2 RAG pipeline
@@ -1618,14 +2361,14 @@ function SidePanel() {
           const matchingPinnedPage = pagesWithMarkdown.find((page) => urlsLikelyMatch(page.url, currentPage.url))
 
           if (matchingPinnedPage) {
-            requestPages = [matchingPinnedPage]
+            requestPages = [annotatePlannerContext(matchingPinnedPage, "current_page", plannerModeLabel)]
             contextFocusLabel = `Focused current page: ${matchingPinnedPage.title}`
           } else {
             setProcessingStage("📍 Reading current page...")
             const scrapedCurrentPage = await scrapeCurrentPageForContext()
 
             if (scrapedCurrentPage?.markdown.trim()) {
-              requestPages = [scrapedCurrentPage]
+              requestPages = [annotatePlannerContext(scrapedCurrentPage, "current_page", plannerModeLabel)]
               contextFocusLabel = `Focused live page: ${scrapedCurrentPage.title}`
             } else {
               contextFocusLabel = "Current page focus requested, but the active tab could not be read"
@@ -1641,16 +2384,32 @@ function SidePanel() {
             )
 
             if (referencePages.length > 0) {
-              requestPages = [currentPageContent, ...referencePages]
+              requestPages = [
+                annotatePlannerContext(currentPageContent, "compare_anchor", plannerModeLabel),
+                ...referencePages.map((page) =>
+                  annotatePlannerContext(page, "reference_context", plannerModeLabel)
+                )
+              ]
               effectiveUserQuestion = contextIntent.rewrittenQuestion || userQuestion
               contextFocusLabel = `Comparing current page against ${referencePages.length} pinned page${referencePages.length > 1 ? "s" : ""}`
             } else {
-              requestPages = [currentPageContent]
+              plannerModeLabel = critiqueMode
+                ? "current-page-critique"
+                : diagramMode
+                  ? "current-page-diagram"
+                  : "current-page-summary"
+              requestPages = [annotatePlannerContext(currentPageContent, "current_page", plannerModeLabel)]
               contextFocusLabel = "Compare requested, but only the current page was available"
             }
           } else {
             contextFocusLabel = "Compare requested, but the current page could not be read"
           }
+        } else if (requestPages.length === 1 && contextIntent.mode === "default") {
+          plannerModeLabel = critiqueMode
+            ? "single-doc-critique"
+            : diagramMode
+              ? "single-doc-diagram"
+              : "single-doc-focus"
         }
 
         if (diagramMode) {
@@ -1671,9 +2430,12 @@ function SidePanel() {
                 role: "assistant",
                 content,
                 timestamp: Date.now(),
+                confidenceWarning: buildConfidenceWarning(cachedDiagram.token_usage),
                 citations: cachedDiagram.citations,
-                diagnostics: prependContextFocusDiagnostic(
+                sourceConflicts: cachedDiagram.source_conflicts,
+                diagnostics: prependPlanningDiagnostics(
                   withCacheBadge(buildDiagramDiagnostics(cachedDiagram), "hit"),
+                  plannerModeLabel,
                   contextFocusLabel || ""
                 )
               }
@@ -1719,9 +2481,12 @@ function SidePanel() {
             role: "assistant",
             content,
             timestamp: Date.now(),
+            confidenceWarning: buildConfidenceWarning(response.token_usage),
             citations: response.citations,
-            diagnostics: prependContextFocusDiagnostic(
+            sourceConflicts: response.source_conflicts,
+            diagnostics: prependPlanningDiagnostics(
               withCacheBadge(buildDiagramDiagnostics(response), "miss"),
+              plannerModeLabel,
               contextFocusLabel || ""
             )
           }
@@ -1738,12 +2503,18 @@ function SidePanel() {
           const assistantMessage: ChatMessage = {
             id: crypto.randomUUID(),
             role: "assistant",
-            content: response.summary,
+            content: ensureVisibleAssistantContent(
+              response.summary,
+              "Review completed, but the model did not return a written summary."
+            ),
             timestamp: Date.now(),
+            confidenceWarning: buildConfidenceWarning(response.token_usage),
             citations: response.citations,
+            sourceConflicts: response.source_conflicts,
             critiqueIssues: response.issues,
-            diagnostics: prependContextFocusDiagnostic(
+            diagnostics: prependPlanningDiagnostics(
               buildCritiqueDiagnostics(response),
+              plannerModeLabel,
               contextFocusLabel || ""
             )
           }
@@ -1768,16 +2539,26 @@ function SidePanel() {
             pinnedPages
           )
           let content = stripMissingInformationSection(response.summary)
+          if (!content.trim()) {
+            content = response.summary.trim()
+          }
+          content = ensureVisibleAssistantContent(
+            content,
+            "The assistant returned an empty answer. Please retry this request."
+          )
 
           const assistantMessage: ChatMessage = {
             id: crypto.randomUUID(),
             role: "assistant",
             content,
             timestamp: Date.now(),
+            confidenceWarning: buildConfidenceWarning(response.token_usage),
             citations: response.citations,
+            sourceConflicts: response.source_conflicts,
             suggestions: filteredSuggestions,
-            diagnostics: prependContextFocusDiagnostic(
+            diagnostics: prependPlanningDiagnostics(
               buildRagDiagnostics(response),
+              plannerModeLabel,
               contextFocusLabel || ""
             )
           }
@@ -2044,7 +2825,62 @@ function SidePanel() {
                       {msg.content}
                     </div>
                   ) : (
-                    <MarkdownMessage content={msg.content} citations={msg.citations} />
+                    <>
+                      {msg.confidenceWarning && (
+                        <div className="plasmo-mb-3 plasmo-rounded-lg plasmo-border plasmo-border-amber-200 plasmo-bg-amber-50 plasmo-p-3">
+                          <div className="plasmo-text-xs plasmo-font-semibold plasmo-uppercase plasmo-tracking-[0.08em] plasmo-text-amber-800">
+                            {msg.confidenceWarning.title}
+                          </div>
+                          <div className="plasmo-mt-1 plasmo-text-sm plasmo-leading-relaxed plasmo-text-amber-900">
+                            {msg.confidenceWarning.message}
+                          </div>
+                          {msg.confidenceWarning.nextStep && (
+                            <div className="plasmo-mt-2 plasmo-text-xs plasmo-leading-relaxed plasmo-text-amber-800">
+                              <span className="plasmo-font-semibold">Next step:</span>{" "}
+                              {msg.confidenceWarning.nextStep}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      <MarkdownMessage content={msg.content} citations={msg.citations} />
+                    </>
+                  )}
+
+                  {msg.sourceConflicts && msg.sourceConflicts.length > 0 && (
+                    <div className="plasmo-mt-3 plasmo-rounded-lg plasmo-border plasmo-border-rose-200 plasmo-bg-rose-50 plasmo-p-3">
+                      <div className="plasmo-text-xs plasmo-font-semibold plasmo-uppercase plasmo-tracking-[0.08em] plasmo-text-rose-800">
+                        Potential Source Conflicts
+                      </div>
+                      <div className="plasmo-mt-2 plasmo-space-y-2">
+                        {msg.sourceConflicts.map((conflict, index) => (
+                          <div
+                            key={`${conflict.topic}-${index}`}
+                            className="plasmo-rounded-md plasmo-border plasmo-border-rose-100 plasmo-bg-white/80 plasmo-p-2.5"
+                          >
+                            <div className="plasmo-text-xs plasmo-font-semibold plasmo-text-rose-900">
+                              {conflict.topic}
+                            </div>
+                            <div className="plasmo-mt-1 plasmo-text-xs plasmo-leading-relaxed plasmo-text-slate-700">
+                              {conflict.summary}
+                            </div>
+                            <div className="plasmo-mt-2 plasmo-space-y-1.5">
+                              <div className="plasmo-text-[11px] plasmo-leading-relaxed plasmo-text-slate-700">
+                                <span className="plasmo-font-semibold plasmo-text-slate-800">
+                                  {conflict.source_a_title}:
+                                </span>{" "}
+                                {conflict.source_a_evidence}
+                              </div>
+                              <div className="plasmo-text-[11px] plasmo-leading-relaxed plasmo-text-slate-700">
+                                <span className="plasmo-font-semibold plasmo-text-slate-800">
+                                  {conflict.source_b_title}:
+                                </span>{" "}
+                                {conflict.source_b_evidence}
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
                   )}
 
                   {msg.citations && msg.citations.length > 0 && (

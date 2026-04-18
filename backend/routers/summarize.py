@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from hashlib import sha1
@@ -15,6 +16,7 @@ from schemas.requests import (
     DiagramResponse,
     HealthResponse,
     PageContent,
+    SourceConflict,
     SummarizeRequest,
     SummarizeResponse,
     infer_source_type,
@@ -88,6 +90,34 @@ DOCUMENT_ROLE_WEIGHTS = {
         "generic": 1.0,
     },
 }
+CONFLICT_TOPIC_HINTS = {
+    "timeout": {
+        "timeout", "ttl", "expire", "expires", "expiration", "refresh", "lifetime", "duration", "validity"
+    },
+    "rate_limit": {
+        "rate", "limit", "throttle", "throttling", "qps", "rpm", "quota", "requests", "minute"
+    },
+    "retry_policy": {
+        "retry", "retries", "backoff", "attempt", "attempts", "interval", "cooldown"
+    },
+    "tenancy": {
+        "tenant", "tenancy", "deployment", "single-tenant", "multi-tenant", "single", "multi"
+    },
+    "status": {
+        "enabled", "disabled", "required", "optional", "public", "private", "sync", "async",
+        "synchronous", "asynchronous", "draft", "final", "deprecated", "supported", "unsupported"
+    },
+}
+CONFLICT_VALUE_PATTERNS = [
+    re.compile(r"\bv?\d+(?:\.\d+){1,3}\b", re.IGNORECASE),
+    re.compile(r"\b\d+(?:\.\d+)?%\b", re.IGNORECASE),
+    re.compile(r"\b\d+(?:\.\d+)?\s?(?:ms|s|sec|secs|seconds|min|mins|minutes|hours|hrs|days)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:enabled|disabled|required|optional|public|private|sync|async|synchronous|asynchronous|draft|final|deprecated|supported|unsupported|single-tenant|multi-tenant|single tenant|multi tenant)\b",
+        re.IGNORECASE,
+    ),
+]
+CONFLICT_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 
 
 @dataclass
@@ -95,6 +125,7 @@ class PageProfile:
     page: PageContent
     original_index: int
     role: str
+    context_role: str
     priority: float
     title_overlap: float
     heading_overlap: float
@@ -231,17 +262,90 @@ def _infer_document_role(page: PageContent) -> str:
     return "generic"
 
 
+def _infer_context_role(page: PageContent) -> str:
+    if not isinstance(page.metadata, dict):
+        return "default"
+
+    raw_value = str(page.metadata.get("context_role") or "").strip().lower()
+    if raw_value in {"current_page", "compare_anchor", "reference_context"}:
+        return raw_value
+
+    return "default"
+
+
+def _infer_planner_mode(
+    pages: list[PageContent],
+    user_question: str,
+    retrieval_mode: str
+) -> tuple[str, str]:
+    normalized_question = (user_question or "").strip().lower()
+    context_roles = {_infer_context_role(page) for page in pages}
+
+    if "compare_anchor" in context_roles:
+        return (
+            "compare-current-vs-pinned",
+            "Kept the current page as the anchor, then balanced evidence from the other pinned references."
+        )
+
+    if "current_page" in context_roles:
+        if retrieval_mode == "critique":
+            return (
+                "current-page-critique",
+                "Focused the review on the active page instead of mixing in the wider context basket."
+            )
+        if retrieval_mode == "diagram":
+            return (
+                "current-page-diagram",
+                "Built the diagram from the active page first so the visual stays anchored to the page in front of the user."
+            )
+        return (
+            "current-page-summary",
+            "Focused retrieval on the active page because the question pointed at the current tab."
+        )
+
+    if retrieval_mode == "diagram":
+        return (
+            "diagram-synthesis",
+            "Favored architecture and flow-heavy sources to keep the diagram grounded and readable."
+        )
+
+    if retrieval_mode == "critique":
+        return (
+            "critique-review",
+            "Favored requirement, spec, and validation-heavy sources to review for gaps and risks."
+        )
+
+    if re.search(r"\b(compare|difference|different|diff|versus|vs\.?)\b", normalized_question):
+        return (
+            "cross-doc-compare",
+            "Treated the request as a comparison and balanced evidence across multiple documents."
+        )
+
+    if len(pages) <= 1:
+        return (
+            "single-doc-focus",
+            "Focused on a single document, so the top chunks stay tightly anchored to that source."
+        )
+
+    return (
+        "multi-doc-synthesis",
+        "Balanced the context basket so one long document does not drown out the rest of the answer."
+    )
+
+
 def _build_page_profile(
     page: PageContent,
     original_index: int,
     user_question: str,
-    retrieval_mode: str
+    retrieval_mode: str,
+    planner_mode: str
 ) -> PageProfile:
     query_terms = set(_tokenize_text(user_question))
     title_terms = set(_tokenize_text(page.title))
     heading_terms = set(_extract_heading_terms(page.markdown))
     url_terms = set(_tokenize_text(_normalize_url_for_matching(page.url)))
     role = _infer_document_role(page)
+    context_role = _infer_context_role(page)
 
     if query_terms:
         title_overlap = len(query_terms & title_terms) / len(query_terms)
@@ -263,12 +367,25 @@ def _build_page_profile(
         if issue_key_match and issue_key_match.group(1).lower() in f"{page.title} {page.url}".lower():
             priority += 0.14
 
+    if context_role == "compare_anchor":
+        priority += 0.18
+    elif context_role == "current_page":
+        priority += 0.16
+    elif context_role == "reference_context":
+        priority += 0.03
+
+    if planner_mode.startswith("compare") and original_index == 0:
+        priority += 0.08
+    elif planner_mode.startswith("current-page") and original_index == 0:
+        priority += 0.06
+
     priority = max(0.80, min(1.35, priority))
 
     return PageProfile(
         page=page,
         original_index=original_index,
         role=role,
+        context_role=context_role,
         priority=priority,
         title_overlap=title_overlap,
         heading_overlap=heading_overlap,
@@ -285,8 +402,9 @@ def _prepare_context_pages(
     user_question: str,
     retrieval_mode: str
 ) -> tuple[list[PageContent], dict[str, PageProfile], dict]:
+    planner_mode, planner_note = _infer_planner_mode(pages, user_question, retrieval_mode)
     profiles = [
-        _build_page_profile(page, index, user_question, retrieval_mode)
+        _build_page_profile(page, index, user_question, retrieval_mode, planner_mode)
         for index, page in enumerate(pages)
     ]
 
@@ -328,6 +446,10 @@ def _prepare_context_pages(
 
     prepared_pages = [profile.page for profile in selected_profiles]
     page_profiles = {profile.page.url: profile for profile in selected_profiles}
+    source_type_counts: dict[str, int] = {}
+
+    for profile in selected_profiles:
+        source_type_counts[profile.page.source_type] = source_type_counts.get(profile.page.source_type, 0) + 1
 
     stats = {
         "input_pages": len(pages),
@@ -337,9 +459,14 @@ def _prepare_context_pages(
         "deduped_by_content": removed_by_content,
         "high_priority_pages": sum(1 for profile in selected_profiles if profile.priority >= 1.12),
         "retrieval_mode": retrieval_mode,
+        "planner_mode": planner_mode,
+        "planner_note": planner_note,
         "routing_note": (
             f"Prioritized {sum(1 for profile in selected_profiles if profile.priority >= 1.12)} "
             f"higher-signal pages using title/query match, document role, and source type."
+        ),
+        "source_diversity_summary": ", ".join(
+            f"{source_type}:{count}" for source_type, count in sorted(source_type_counts.items())
         ),
         "ignored_pages_summary": "; ".join(ignored_labels[:3]) if ignored_labels else "",
     }
@@ -386,6 +513,134 @@ def _build_selection_summaries(
         "selected_sources_summary": "; ".join(selected_labels[:4]) if selected_labels else "",
         "omitted_sources_summary": "; ".join(omitted_labels) if omitted_labels else "",
     }
+
+
+def _normalize_conflict_topic(topic: str) -> str:
+    return topic.replace("_", " ").title()
+
+
+def _extract_conflict_values(sentence: str) -> list[str]:
+    values: list[str] = []
+
+    for pattern in CONFLICT_VALUE_PATTERNS:
+        for match in pattern.findall(sentence):
+            normalized = re.sub(r"\s+", " ", str(match).strip().lower())
+            if normalized and normalized not in values:
+                values.append(normalized)
+
+    return values
+
+
+def _infer_conflict_topic(tokens: set[str]) -> str | None:
+    for topic, hints in CONFLICT_TOPIC_HINTS.items():
+        if tokens & hints:
+            return topic
+    return None
+
+
+def _extract_conflict_candidates(retrieved_chunks: list) -> list[dict]:
+    candidates: list[dict] = []
+
+    for chunk in retrieved_chunks:
+        sentences = CONFLICT_SENTENCE_SPLIT_RE.split(chunk.text)
+
+        for sentence in sentences:
+            normalized_sentence = re.sub(r"\s+", " ", sentence.strip())
+            if len(normalized_sentence) < 30 or len(normalized_sentence) > 260:
+                continue
+
+            if normalized_sentence.startswith("#") or normalized_sentence.startswith("["):
+                continue
+
+            sentence_tokens = set(_tokenize_text(normalized_sentence))
+            if len(sentence_tokens) < 3:
+                continue
+
+            topic = _infer_conflict_topic(sentence_tokens)
+            if not topic:
+                continue
+
+            values = _extract_conflict_values(normalized_sentence)
+            if not values:
+                continue
+
+            topic_tokens = CONFLICT_TOPIC_HINTS.get(topic, set())
+            value_tokens = set(_tokenize_text(" ".join(values)))
+            subject_tokens = [
+                token for token in sentence_tokens
+                if token not in topic_tokens and token not in value_tokens
+            ]
+
+            if len(subject_tokens) < 1:
+                continue
+
+            candidates.append(
+                {
+                    "topic": topic,
+                    "page_title": chunk.metadata.page_title,
+                    "page_url": chunk.metadata.page_url,
+                    "sentence": normalized_sentence,
+                    "values": values,
+                    "value_key": "|".join(values),
+                    "subject_tokens": set(subject_tokens),
+                }
+            )
+
+    return candidates
+
+
+def _detect_source_conflicts(retrieved_chunks: list) -> list[SourceConflict]:
+    candidates = _extract_conflict_candidates(retrieved_chunks)
+    conflicts: list[tuple[int, SourceConflict]] = []
+    seen_pairs: set[tuple[str, str, str]] = set()
+
+    for left_index, left in enumerate(candidates):
+        for right in candidates[left_index + 1:]:
+            if left["page_url"] == right["page_url"]:
+                continue
+
+            if left["topic"] != right["topic"]:
+                continue
+
+            if left["value_key"] == right["value_key"]:
+                continue
+
+            subject_overlap = left["subject_tokens"] & right["subject_tokens"]
+            if len(subject_overlap) < 1:
+                continue
+
+            # Avoid flagging noisy version mentions unless the subject is clearly shared.
+            if left["topic"] == "status" and len(subject_overlap) < 2:
+                continue
+
+            pair_key = tuple(sorted((left["page_url"], right["page_url"]))) + (left["topic"],)
+            if pair_key in seen_pairs:
+                continue
+
+            seen_pairs.add(pair_key)
+            shared_subject = ", ".join(sorted(subject_overlap)[:3]) or _normalize_conflict_topic(left["topic"]).lower()
+            summary = (
+                f"{_normalize_conflict_topic(left['topic'])} looks inconsistent for {shared_subject}: "
+                f"{left['page_title']} says {' / '.join(left['values'])}, "
+                f"while {right['page_title']} says {' / '.join(right['values'])}."
+            )
+
+            conflicts.append(
+                (
+                    len(subject_overlap),
+                    SourceConflict(
+                        topic=_normalize_conflict_topic(left["topic"]),
+                        summary=summary,
+                        source_a_title=left["page_title"],
+                        source_a_evidence=_shorten_text(left["sentence"], 180),
+                        source_b_title=right["page_title"],
+                        source_b_evidence=_shorten_text(right["sentence"], 180),
+                    ),
+                )
+            )
+
+    conflicts.sort(key=lambda item: item[0], reverse=True)
+    return [conflict for _, conflict in conflicts[:3]]
 
 
 def _build_chunk_embedding_text(chunk) -> str:
@@ -534,12 +789,12 @@ def _provider_error_detail(
     settings: Settings,
     error: Exception
 ) -> str:
-    gateway = settings.resolved_openai_base_url() if settings.llm_provider == "openai" else None
+    gateway = settings.resolved_openai_base_url() if settings.resolved_cloud_provider() == "openai" else None
     gateway_hint = f" via gateway {gateway}" if gateway else ""
 
     return (
         f"Gateway forbids the {stage} model '{model_name}' for provider "
-        f"'{settings.llm_provider}'{gateway_hint}. Original error: {error}"
+        f"'{settings.resolved_cloud_provider()}'{gateway_hint}. Original error: {error}"
     )
 
 
@@ -608,6 +863,195 @@ def _build_page_chunk_caps(page_profiles: dict[str, PageProfile]) -> dict[str, i
     return caps
 
 
+def _build_source_type_chunk_caps(
+    page_profiles: dict[str, PageProfile],
+    planner_mode: str
+) -> dict[str, int]:
+    source_page_counts: dict[str, int] = {}
+
+    for profile in page_profiles.values():
+        source_page_counts[profile.page.source_type] = source_page_counts.get(profile.page.source_type, 0) + 1
+
+    if len(source_page_counts) <= 1:
+        return {}
+
+    caps: dict[str, int] = {}
+    compare_mode = planner_mode.startswith("compare")
+    current_focus_mode = planner_mode.startswith("current-page")
+
+    for source_type, page_count in source_page_counts.items():
+        if compare_mode:
+            cap = 2 if page_count <= 2 else 3
+        elif current_focus_mode:
+            cap = 2
+        else:
+            cap = 3 if page_count <= 3 else 4
+
+        caps[source_type] = cap
+
+    return caps
+
+
+def _build_context_budget_policy(
+    settings: Settings,
+    retrieval_mode: str,
+    planner_mode: str
+) -> dict[str, object]:
+    model_route = settings.resolved_model_route(retrieval_mode)
+    target_model = settings.resolved_model_for_task(retrieval_mode)
+    compare_mode = planner_mode.startswith("compare")
+    single_page_focus_mode = planner_mode.startswith("current-page") or planner_mode.startswith("single-doc")
+
+    policy: dict[str, object] = {
+        "policy_name": "default-shared-context",
+        "provider": settings.llm_provider,
+        "model_route": model_route,
+        "target_model": target_model,
+        "max_candidates": 20,
+        "max_total_chunks": None,
+        "max_chunks_per_page": 3,
+        "max_input_tokens_override": None,
+        "max_stitched_chunks": None,
+        "stitch_edge_radius": None,
+        "stitch_max_bridge_gap": None,
+    }
+
+    if settings.llm_provider == "ollama":
+        if model_route == "summary":
+            policy.update(
+                {
+                    "policy_name": "ollama-summary-tight",
+                    "max_candidates": 12,
+                    "max_total_chunks": 5,
+                    "max_chunks_per_page": 2,
+                    "max_input_tokens_override": 5200,
+                    "max_stitched_chunks": 2,
+                    "stitch_edge_radius": 1,
+                    "stitch_max_bridge_gap": 1,
+                }
+            )
+        else:
+            policy.update(
+                {
+                    "policy_name": "ollama-reasoning-balanced",
+                    "max_candidates": 14,
+                    "max_total_chunks": 7 if not compare_mode else 6,
+                    "max_chunks_per_page": 3,
+                    "max_input_tokens_override": 7600 if not compare_mode else 6800,
+                    "max_stitched_chunks": 3,
+                    "stitch_edge_radius": 1,
+                    "stitch_max_bridge_gap": 2 if single_page_focus_mode else 1,
+                }
+            )
+    elif model_route == "reasoning" and settings.resolved_reasoning_model() != settings.resolved_summary_model():
+        policy.update(
+            {
+                "policy_name": "reasoning-route-balanced",
+                "max_candidates": 16,
+                "max_total_chunks": 8 if not compare_mode else 7,
+                "max_chunks_per_page": 3,
+                "max_input_tokens_override": 12000 if not compare_mode else 10000,
+                "max_stitched_chunks": 3,
+            }
+        )
+
+    return policy
+
+
+def _build_low_confidence_next_step(
+    user_question: str | None,
+    retrieval_mode: str,
+    retrieval_stats: dict
+) -> str:
+    query_terms = _tokenize_text(user_question or "")[:3]
+    query_hint = f" that explicitly mentions {', '.join(query_terms)}" if query_terms else ""
+
+    if retrieval_stats.get("input_pages", 0) >= 3 and retrieval_stats.get("selected_pages", 0) <= 1:
+        return "Remove unrelated pages or ask to focus on the current page so the context basket is tighter."
+
+    if retrieval_mode == "critique":
+        return (
+            "Pin acceptance criteria, QA notes, or edge-case details"
+            f"{query_hint} before retrying."
+        )
+
+    if retrieval_mode == "diagram":
+        return (
+            "Pin an architecture, API, or flow document"
+            f"{query_hint} before asking for a diagram again."
+        )
+
+    return (
+        "Pin a more direct PRD, spec, or source page"
+        f"{query_hint}, or rephrase the question using the document's own terms."
+    )
+
+
+def _build_confidence_assessment(
+    user_question: str | None,
+    retrieval_mode: str,
+    retrieval_stats: dict
+) -> dict[str, str | bool]:
+    hard_reasons: list[str] = []
+    supporting_reasons: list[str] = []
+
+    avg_similarity = float(retrieval_stats.get("avg_similarity") or 0)
+    candidates_found = int(retrieval_stats.get("candidates_found") or 0)
+    input_pages = int(retrieval_stats.get("input_pages") or 0)
+    selected_pages = int(retrieval_stats.get("selected_pages") or 0)
+
+    if retrieval_stats.get("retrieval_no_match_fallback_used"):
+        hard_reasons.append(
+            "The question had weak overlap with the pinned pages, so retrieval fell back to top-ranked context."
+        )
+
+    if retrieval_stats.get("similarity_fallback_used"):
+        hard_reasons.append(
+            "Similarity scores were weak, so the assistant used the best available excerpts instead of strong matches."
+        )
+    elif avg_similarity and avg_similarity < 0.28:
+        hard_reasons.append(
+            "The retrieved excerpts only weakly matched the question."
+        )
+
+    if retrieval_stats.get("retrieval_strategy") == "lexical-fallback":
+        supporting_reasons.append(
+            "Retrieval relied on keyword overlap because embeddings were unavailable."
+        )
+
+    if input_pages >= 3 and selected_pages <= 1:
+        supporting_reasons.append(
+            "Most evidence came from a single page inside a larger context basket."
+        )
+
+    if candidates_found <= 3:
+        supporting_reasons.append(
+            "Only a small number of relevant chunks were found."
+        )
+
+    low_confidence = bool(hard_reasons) or len(supporting_reasons) >= 2
+
+    if not low_confidence:
+        return {
+            "low_confidence": False,
+            "confidence_level": "normal",
+        }
+
+    reason_parts = hard_reasons[:2] if hard_reasons else supporting_reasons[:2]
+    confidence_note = "Answer may be incomplete. " + " ".join(reason_parts)
+
+    return {
+        "low_confidence": True,
+        "confidence_level": "low",
+        "confidence_note": confidence_note,
+        "confidence_next_step": _build_low_confidence_next_step(
+            user_question,
+            retrieval_mode,
+            retrieval_stats,
+        ),
+    }
+
+
 def _rerank_candidates(user_question: str, candidates: list[tuple]) -> list[tuple]:
     reranked = []
 
@@ -623,83 +1067,194 @@ def _chunk_key(chunk) -> tuple[str, int]:
     return (chunk.metadata.page_url, chunk.metadata.chunk_index)
 
 
-def _expand_adjacent_chunks(
+def _stitch_selected_chunks(
     selected_chunks: list,
     scored_chunks: list[tuple],
     all_chunks: list,
+    page_profiles: dict[str, PageProfile],
     token_counter: TokenCounter,
-    reserve_tokens: int
-) -> tuple[list, int]:
+    reserve_tokens: int,
+    planner_mode: str,
+    max_input_tokens_override: int | None = None,
+    max_stitched_chunks: int | None = None,
+    stitch_edge_radius: int | None = None,
+    stitch_max_bridge_gap: int | None = None,
+) -> tuple[list, dict[str, int | bool | str]]:
     if not selected_chunks:
-        return selected_chunks, 0
+        return selected_chunks, {
+            "stitched_chunks_added": 0,
+            "stitched_bridge_chunks_added": 0,
+            "stitching_applied": False,
+            "stitching_mode": "none",
+        }
 
-    max_input = token_counter.settings.max_input_tokens - reserve_tokens
+    max_input = (
+        max_input_tokens_override
+        if max_input_tokens_override is not None
+        else token_counter.settings.max_input_tokens - reserve_tokens
+    )
     total_tokens = token_counter.count_chunks(selected_chunks)
     selected_keys = {_chunk_key(chunk) for chunk in selected_chunks}
     chunk_lookup = {_chunk_key(chunk): chunk for chunk in all_chunks}
-
-    adjacent_candidates: list[tuple[int, int, object]] = []
-
-    for anchor_index, chunk in enumerate(selected_chunks):
-        page_url = chunk.metadata.page_url
-        chunk_index = chunk.metadata.chunk_index
-
-        for offset_order, offset in enumerate((-1, 1)):
-            neighbor_key = (page_url, chunk_index + offset)
-
-            if neighbor_key in selected_keys or neighbor_key not in chunk_lookup:
-                continue
-
-            adjacent_candidates.append((anchor_index, offset_order, chunk_lookup[neighbor_key]))
-
-    added_chunks = {}
-    added_count = 0
-
-    for _, _, neighbor in adjacent_candidates:
-        neighbor_key = _chunk_key(neighbor)
-
-        if neighbor_key in selected_keys or neighbor_key in added_chunks:
-            continue
-
-        neighbor_tokens = token_counter.count_text(neighbor.text)
-        if total_tokens + neighbor_tokens > max_input:
-            continue
-
-        added_chunks[neighbor_key] = neighbor
-        total_tokens += neighbor_tokens
-        added_count += 1
-
-    if not added_chunks:
-        return selected_chunks, 0
-
-    ordered_chunks = []
-    seen_keys = set()
+    score_lookup = {_chunk_key(chunk): score for chunk, score in scored_chunks}
+    page_order: list[str] = []
+    selected_indices_by_page: dict[str, set[int]] = {}
 
     for chunk in selected_chunks:
         page_url = chunk.metadata.page_url
-        chunk_index = chunk.metadata.chunk_index
+        if page_url not in selected_indices_by_page:
+            page_order.append(page_url)
+            selected_indices_by_page[page_url] = set()
+        selected_indices_by_page[page_url].add(chunk.metadata.chunk_index)
 
-        prev_key = (page_url, chunk_index - 1)
-        if prev_key in added_chunks and prev_key not in seen_keys:
-            ordered_chunks.append(added_chunks[prev_key])
-            seen_keys.add(prev_key)
+    compare_mode = planner_mode.startswith("compare")
+    single_page_focus_mode = (
+        planner_mode.startswith("current-page")
+        or planner_mode.startswith("single-doc")
+    )
+    max_bridge_gap = stitch_max_bridge_gap if stitch_max_bridge_gap is not None else (2 if single_page_focus_mode else 1)
+    edge_radius = stitch_edge_radius if stitch_edge_radius is not None else (1 if compare_mode else 2 if single_page_focus_mode else 1)
+    stitch_mode = "bridge+adjacent" if max_bridge_gap > 0 else "adjacent"
 
+    candidate_entries: list[tuple[tuple, object, str]] = []
+    candidate_keys: set[tuple[str, int]] = set()
+
+    def queue_candidate(
+        candidate_chunk,
+        strategy: str,
+        distance: int,
+        anchor_score: float,
+        page_priority: float,
+        page_rank: int,
+    ) -> None:
+        candidate_key = _chunk_key(candidate_chunk)
+        if candidate_key in selected_keys or candidate_key in candidate_keys:
+            return
+
+        candidate_keys.add(candidate_key)
+        strategy_rank = 0 if strategy == "bridge" else 1
+        candidate_entries.append(
+            (
+                (
+                    strategy_rank,
+                    page_rank,
+                    -page_priority,
+                    -anchor_score,
+                    distance,
+                    candidate_chunk.metadata.chunk_index,
+                ),
+                candidate_chunk,
+                strategy,
+            )
+        )
+
+    for page_rank, page_url in enumerate(page_order):
+        selected_indices = sorted(selected_indices_by_page.get(page_url, set()))
+        if not selected_indices:
+            continue
+
+        page_priority = page_profiles.get(page_url).priority if page_url in page_profiles else 1.0
+
+        for previous_index, next_index in zip(selected_indices, selected_indices[1:]):
+            gap = next_index - previous_index - 1
+            if gap <= 0 or gap > max_bridge_gap:
+                continue
+
+            left_score = score_lookup.get((page_url, previous_index), 0.0)
+            right_score = score_lookup.get((page_url, next_index), 0.0)
+            anchor_score = max(left_score, right_score)
+
+            for middle_index in range(previous_index + 1, next_index):
+                middle_key = (page_url, middle_index)
+                middle_chunk = chunk_lookup.get(middle_key)
+                if not middle_chunk:
+                    continue
+                queue_candidate(
+                    middle_chunk,
+                    strategy="bridge",
+                    distance=gap,
+                    anchor_score=anchor_score,
+                    page_priority=page_priority,
+                    page_rank=page_rank,
+                )
+
+        for selected_index in selected_indices:
+            anchor_score = score_lookup.get((page_url, selected_index), 0.0)
+            for offset in range(1, edge_radius + 1):
+                for direction in (-1, 1):
+                    neighbor_key = (page_url, selected_index + (direction * offset))
+                    neighbor_chunk = chunk_lookup.get(neighbor_key)
+                    if not neighbor_chunk:
+                        continue
+                    queue_candidate(
+                        neighbor_chunk,
+                        strategy="adjacent",
+                        distance=offset,
+                        anchor_score=anchor_score,
+                        page_priority=page_priority,
+                        page_rank=page_rank,
+                    )
+
+    added_chunks: dict[tuple[str, int], object] = {}
+    stitched_chunks_added = 0
+    bridge_chunks_added = 0
+
+    for _, candidate_chunk, strategy in sorted(candidate_entries, key=lambda item: item[0]):
+        candidate_key = _chunk_key(candidate_chunk)
+        if candidate_key in selected_keys or candidate_key in added_chunks:
+            continue
+
+        if max_stitched_chunks is not None and stitched_chunks_added >= max_stitched_chunks:
+            break
+
+        candidate_tokens = token_counter.count_text(candidate_chunk.text)
+        if total_tokens + candidate_tokens > max_input:
+            continue
+
+        added_chunks[candidate_key] = candidate_chunk
+        total_tokens += candidate_tokens
+        stitched_chunks_added += 1
+        if strategy == "bridge":
+            bridge_chunks_added += 1
+
+    if not added_chunks:
+        return selected_chunks, {
+            "stitched_chunks_added": 0,
+            "stitched_bridge_chunks_added": 0,
+            "stitching_applied": False,
+            "stitching_mode": stitch_mode,
+        }
+
+    ordered_chunks: list = []
+    seen_keys: set[tuple[str, int]] = set()
+
+    for page_url in page_order:
+        page_chunk_keys = [
+            chunk_key
+            for chunk_key in sorted(selected_keys | set(added_chunks.keys()), key=lambda item: item[1])
+            if chunk_key[0] == page_url
+        ]
+        for page_chunk_key in page_chunk_keys:
+            if page_chunk_key in seen_keys:
+                continue
+            if page_chunk_key in added_chunks:
+                ordered_chunks.append(added_chunks[page_chunk_key])
+            else:
+                ordered_chunks.append(chunk_lookup[page_chunk_key])
+            seen_keys.add(page_chunk_key)
+
+    for chunk in selected_chunks:
         current_key = _chunk_key(chunk)
         if current_key not in seen_keys:
             ordered_chunks.append(chunk)
             seen_keys.add(current_key)
 
-        next_key = (page_url, chunk_index + 1)
-        if next_key in added_chunks and next_key not in seen_keys:
-            ordered_chunks.append(added_chunks[next_key])
-            seen_keys.add(next_key)
-
-    for neighbor_key, neighbor in added_chunks.items():
-        if neighbor_key not in seen_keys:
-            ordered_chunks.append(neighbor)
-            seen_keys.add(neighbor_key)
-
-    return ordered_chunks, added_count
+    return ordered_chunks, {
+        "stitched_chunks_added": stitched_chunks_added,
+        "stitched_bridge_chunks_added": bridge_chunks_added,
+        "stitching_applied": stitched_chunks_added > 0,
+        "stitching_mode": stitch_mode,
+    }
 
 
 async def retrieve_relevant_chunks(
@@ -726,6 +1281,14 @@ async def retrieve_relevant_chunks(
             status_code=400,
             detail="No content to process - all pages are empty"
         )
+
+    settings = get_settings()
+    planner_mode = context_page_stats.get("planner_mode", "multi-doc-synthesis")
+    budget_policy = _build_context_budget_policy(
+        settings=settings,
+        retrieval_mode=retrieval_mode,
+        planner_mode=planner_mode,
+    )
 
     corpus_signature = retrieval_cache.build_corpus_signature(prepared_pages)
     cached_corpus = retrieval_cache.get_corpus(corpus_signature)
@@ -775,7 +1338,7 @@ async def retrieve_relevant_chunks(
         )
 
     question_signature = retrieval_cache.build_query_signature(request.user_question)
-    top_k_candidates = min(20, len(chunks))
+    top_k_candidates = min(int(budget_policy["max_candidates"]), len(chunks))
     query_embedding = None
     query_embedding_cache_hit = False
     no_match_fallback_used = False
@@ -886,11 +1449,28 @@ async def retrieve_relevant_chunks(
         )
 
     page_chunk_caps = _build_page_chunk_caps(page_profiles)
+    max_chunks_per_page = int(budget_policy["max_chunks_per_page"])
+    page_chunk_caps = {
+        page_url: min(cap, max_chunks_per_page)
+        for page_url, cap in page_chunk_caps.items()
+    }
+    source_type_chunk_caps = _build_source_type_chunk_caps(
+        page_profiles,
+        planner_mode
+    )
+    effective_context_budget_tokens = (
+        int(budget_policy["max_input_tokens_override"])
+        if budget_policy.get("max_input_tokens_override") is not None
+        else token_counter.settings.max_input_tokens - reserve_tokens
+    )
     retrieved_chunks = token_counter.select_chunks_within_budget(
         chunks_with_scores=filtered_results,
         reserve_tokens=reserve_tokens,
-        max_chunks_per_page=3,
-        page_chunk_caps=page_chunk_caps
+        max_chunks_per_page=max_chunks_per_page,
+        page_chunk_caps=page_chunk_caps,
+        source_type_chunk_caps=source_type_chunk_caps,
+        max_total_chunks=budget_policy.get("max_total_chunks"),
+        max_input_tokens_override=budget_policy.get("max_input_tokens_override"),
     )
 
     if not retrieved_chunks:
@@ -899,16 +1479,23 @@ async def retrieve_relevant_chunks(
             detail="No chunks fit within token budget"
         )
 
-    retrieved_chunks, adjacent_chunks_added = _expand_adjacent_chunks(
+    retrieved_chunks, stitching_stats = _stitch_selected_chunks(
         selected_chunks=retrieved_chunks,
         scored_chunks=filtered_results,
         all_chunks=chunks,
+        page_profiles=page_profiles,
         token_counter=token_counter,
-        reserve_tokens=reserve_tokens
+        reserve_tokens=reserve_tokens,
+        planner_mode=planner_mode,
+        max_input_tokens_override=budget_policy.get("max_input_tokens_override"),
+        max_stitched_chunks=budget_policy.get("max_stitched_chunks"),
+        stitch_edge_radius=budget_policy.get("stitch_edge_radius"),
+        stitch_max_bridge_gap=budget_policy.get("stitch_max_bridge_gap"),
     )
 
     selected_tokens = token_counter.count_chunks(retrieved_chunks)
     selected_page_urls = {chunk.metadata.page_url for chunk in retrieved_chunks}
+    source_conflicts = _detect_source_conflicts(retrieved_chunks)
     similarity_scores = [
         score for chunk, score in filtered_results
         if chunk in retrieved_chunks
@@ -927,20 +1514,40 @@ async def retrieve_relevant_chunks(
         "avg_similarity": sum(similarity_scores) / len(similarity_scores) if similarity_scores else 0,
         "selected_chunk_tokens": selected_tokens,
         "selected_pages": len(selected_page_urls),
-        "adjacent_chunks_added": adjacent_chunks_added,
+        "adjacent_chunks_added": stitching_stats["stitched_chunks_added"],
+        "stitched_chunks_added": stitching_stats["stitched_chunks_added"],
+        "stitched_bridge_chunks_added": stitching_stats["stitched_bridge_chunks_added"],
+        "stitching_applied": stitching_stats["stitching_applied"],
+        "stitching_mode": stitching_stats["stitching_mode"],
         "corpus_cache_hit": corpus_cache_hit,
         "query_embedding_cache_hit": query_embedding_cache_hit,
         "similarity_threshold": min_similarity,
         "similarity_fallback_used": similarity_fallback_used,
-        "context_budget_tokens": token_counter.settings.max_input_tokens - reserve_tokens,
+        "context_budget_tokens": effective_context_budget_tokens,
+        "context_budget_policy": str(budget_policy["policy_name"]),
+        "context_budget_chunk_cap": budget_policy.get("max_total_chunks"),
+        "context_budget_candidate_cap": budget_policy.get("max_candidates"),
+        "context_budget_page_cap": budget_policy.get("max_chunks_per_page"),
+        "context_budget_model_route": str(budget_policy["model_route"]),
+        "context_budget_target_model": str(budget_policy["target_model"]),
         "retrieval_strategy": "dense+hybrid" if embeddings_available and question_embedding is not None else "lexical-fallback",
         "embedding_fallback_used": embedding_fallback_used,
         "embedding_provider_forbidden": _is_forbidden_provider_error(embedding_fallback_reason) if embedding_fallback_reason else False,
         "retrieval_no_match_fallback_used": no_match_fallback_used,
+        "source_type_diversity_caps_applied": bool(source_type_chunk_caps),
+        "source_conflict_count": len(source_conflicts),
+        "source_conflict_summary": source_conflicts[0].summary if source_conflicts else "",
     }
     retrieval_stats.update(context_page_stats)
     retrieval_stats.update(selection_summaries)
     retrieval_stats.update(reranker_stats)
+    retrieval_stats.update(
+        _build_confidence_assessment(
+            request.user_question,
+            retrieval_mode,
+            retrieval_stats,
+        )
+    )
     logger.info(
         "Retrieval completed mode=%s input_pages=%s prepared_pages=%s chunks=%s retrieved_chunks=%s strategy=%s deduped_pages=%s corpus_cache_hit=%s query_embedding_cache_hit=%s embedding_fallback_used=%s no_match_fallback_used=%s",
         retrieval_mode,
@@ -956,7 +1563,7 @@ async def retrieve_relevant_chunks(
         no_match_fallback_used,
     )
 
-    return retrieved_chunks, retrieval_stats
+    return retrieved_chunks, retrieval_stats, source_conflicts
 
 
 @router.post("/summarize", response_model=SummarizeResponse)
@@ -1061,6 +1668,7 @@ async def rag_summarize_pages(
     Returns summary with chunk-level citations and token usage.
     """
     try:
+        request_started_at = time.perf_counter()
         settings = get_settings()
         prepared_pages = _prepare_pages(request.pages)
         logger.info(
@@ -1083,7 +1691,8 @@ async def rag_summarize_pages(
                 detail="user_question is required for RAG-based summarization"
             )
 
-        retrieved_chunks, retrieval_stats = await retrieve_relevant_chunks(
+        retrieval_started_at = time.perf_counter()
+        retrieved_chunks, retrieval_stats, source_conflicts = await retrieve_relevant_chunks(
             request=SummarizeRequest(
                 pages=prepared_pages,
                 user_question=user_question
@@ -1097,15 +1706,33 @@ async def rag_summarize_pages(
             reserve_tokens=6000,
             retrieval_mode="answer"
         )
+        retrieval_latency_ms = round((time.perf_counter() - retrieval_started_at) * 1000)
+
+        llm_chunks = retrieved_chunks
+        hybrid_prefilter_stats: dict[str, object] = {"hybrid_prefilter_applied": False}
+        if settings.hybrid_mode_enabled():
+            llm_chunks, hybrid_prefilter_stats = await llm_service.prefilter_chunks(
+                retrieved_chunks,
+                user_question,
+                task_kind="answer",
+                planner_mode=str(retrieval_stats.get("planner_mode") or ""),
+            )
+            hybrid_prefilter_stats["hybrid_prefilter_context_tokens"] = token_counter.count_chunks(llm_chunks)
 
         # Step 7: Generate summary using only retrieved chunks
+        generation_started_at = time.perf_counter()
         summary, citations, token_usage, suggestions = await llm_service.summarize_from_chunks(
-            chunks=retrieved_chunks,
+            chunks=llm_chunks,
             user_question=user_question
         )
+        generation_latency_ms = round((time.perf_counter() - generation_started_at) * 1000)
 
         # Add chunking metadata to token usage
         token_usage.update(retrieval_stats)
+        token_usage.update(hybrid_prefilter_stats)
+        token_usage["retrieval_latency_ms"] = retrieval_latency_ms
+        token_usage.setdefault("generation_latency_ms", generation_latency_ms)
+        token_usage["end_to_end_latency_ms"] = round((time.perf_counter() - request_started_at) * 1000)
 
         # Estimate API cost
         cost_estimate = token_counter.estimate_cost(
@@ -1117,6 +1744,7 @@ async def rag_summarize_pages(
         return SummarizeResponse(
             summary=summary,
             citations=citations,
+            source_conflicts=source_conflicts or None,
             token_usage=token_usage,
             model_used=llm_service.get_model_name(),
             suggestions=suggestions
@@ -1163,6 +1791,7 @@ async def critique_pages(
     from summarization to critique.
     """
     try:
+        request_started_at = time.perf_counter()
         settings = get_settings()
         prepared_pages = _prepare_pages(request.pages)
         logger.info(
@@ -1181,7 +1810,8 @@ async def critique_pages(
             "Review these documents for missing requirements, edge cases, and risks."
         )
 
-        retrieved_chunks, retrieval_stats = await retrieve_relevant_chunks(
+        retrieval_started_at = time.perf_counter()
+        retrieved_chunks, retrieval_stats, source_conflicts = await retrieve_relevant_chunks(
             request=SummarizeRequest(
                 pages=prepared_pages,
                 user_question=user_question
@@ -1195,13 +1825,31 @@ async def critique_pages(
             reserve_tokens=6500,
             retrieval_mode="critique"
         )
+        retrieval_latency_ms = round((time.perf_counter() - retrieval_started_at) * 1000)
 
+        llm_chunks = retrieved_chunks
+        hybrid_prefilter_stats: dict[str, object] = {"hybrid_prefilter_applied": False}
+        if settings.hybrid_mode_enabled():
+            llm_chunks, hybrid_prefilter_stats = await llm_service.prefilter_chunks(
+                retrieved_chunks,
+                user_question,
+                task_kind="critique",
+                planner_mode=str(retrieval_stats.get("planner_mode") or ""),
+            )
+            hybrid_prefilter_stats["hybrid_prefilter_context_tokens"] = token_counter.count_chunks(llm_chunks)
+
+        generation_started_at = time.perf_counter()
         summary, issues, citations, token_usage = await llm_service.critique_from_chunks(
-            chunks=retrieved_chunks,
+            chunks=llm_chunks,
             user_question=user_question
         )
+        generation_latency_ms = round((time.perf_counter() - generation_started_at) * 1000)
 
         token_usage.update(retrieval_stats)
+        token_usage.update(hybrid_prefilter_stats)
+        token_usage["retrieval_latency_ms"] = retrieval_latency_ms
+        token_usage.setdefault("generation_latency_ms", generation_latency_ms)
+        token_usage["end_to_end_latency_ms"] = round((time.perf_counter() - request_started_at) * 1000)
         token_usage["issues_found"] = len(issues)
         token_usage["cost_estimate"] = token_counter.estimate_cost(
             input_tokens=token_usage.get("input_tokens", 0),
@@ -1212,6 +1860,7 @@ async def critique_pages(
             summary=summary,
             issues=issues,
             citations=citations,
+            source_conflicts=source_conflicts or None,
             token_usage=token_usage,
             model_used=llm_service.get_model_name(),
         )
@@ -1258,6 +1907,7 @@ async def generate_diagram(
     - **diagram_type**: Optional preferred Mermaid type
     """
     try:
+        request_started_at = time.perf_counter()
         settings = get_settings()
         prepared_pages = _prepare_pages(request.pages)
         logger.info(
@@ -1280,7 +1930,8 @@ async def generate_diagram(
                 detail="user_question is required for diagram generation"
             )
 
-        retrieved_chunks, retrieval_stats = await retrieve_relevant_chunks(
+        retrieval_started_at = time.perf_counter()
+        retrieved_chunks, retrieval_stats, source_conflicts = await retrieve_relevant_chunks(
             request=SummarizeRequest(
                 pages=prepared_pages,
                 user_question=user_question
@@ -1294,16 +1945,34 @@ async def generate_diagram(
             reserve_tokens=7000,
             retrieval_mode="diagram"
         )
+        retrieval_latency_ms = round((time.perf_counter() - retrieval_started_at) * 1000)
 
+        llm_chunks = retrieved_chunks
+        hybrid_prefilter_stats: dict[str, object] = {"hybrid_prefilter_applied": False}
+        if settings.hybrid_mode_enabled():
+            llm_chunks, hybrid_prefilter_stats = await llm_service.prefilter_chunks(
+                retrieved_chunks,
+                user_question,
+                task_kind="diagram",
+                planner_mode=str(retrieval_stats.get("planner_mode") or ""),
+            )
+            hybrid_prefilter_stats["hybrid_prefilter_context_tokens"] = token_counter.count_chunks(llm_chunks)
+
+        generation_started_at = time.perf_counter()
         summary, mermaid_code, is_valid, diagram_type, citations, token_usage = (
             await llm_service.generate_diagram_from_chunks(
-                chunks=retrieved_chunks,
+                chunks=llm_chunks,
                 user_question=user_question,
                 diagram_type=request.diagram_type
             )
         )
+        generation_latency_ms = round((time.perf_counter() - generation_started_at) * 1000)
 
         token_usage.update(retrieval_stats)
+        token_usage.update(hybrid_prefilter_stats)
+        token_usage["retrieval_latency_ms"] = retrieval_latency_ms
+        token_usage.setdefault("generation_latency_ms", generation_latency_ms)
+        token_usage["end_to_end_latency_ms"] = round((time.perf_counter() - request_started_at) * 1000)
         token_usage["cost_estimate"] = token_counter.estimate_cost(
             input_tokens=token_usage.get("input_tokens", 0),
             output_tokens=token_usage.get("output_tokens", 0)
@@ -1315,6 +1984,7 @@ async def generate_diagram(
             is_valid=is_valid,
             diagram_type=diagram_type,
             citations=citations,
+            source_conflicts=source_conflicts or None,
             token_usage=token_usage,
             model_used=llm_service.get_model_name(),
         )
@@ -1350,11 +2020,9 @@ async def health_check(settings: Annotated[Settings, Depends(get_settings)]):
 
     Returns current configuration and status.
     """
-    model = settings.openai_model if settings.llm_provider == "openai" else settings.anthropic_model
-
     return HealthResponse(
         status="healthy",
         app_name=settings.app_name,
         llm_provider=settings.llm_provider,
-        model=model,
+        model=settings.resolved_primary_model(),
     )

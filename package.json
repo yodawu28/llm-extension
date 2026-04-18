@@ -10,7 +10,8 @@
     "build": "plasmo build",
     "package": "pnpm build && node scripts/package-extension.mjs",
     "package:plasmo": "plasmo package",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "benchmark:phase3d": "node scripts/benchmark-phase3d.mjs"
   },
   "dependencies": {
     "dompurify": "^3.2.2",

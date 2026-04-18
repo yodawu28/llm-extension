@@ -17,6 +17,37 @@ Browser extension + FastAPI backend for building a shared context basket from Ji
 - `backend/`: FastAPI API, retrieval pipeline, LLM integration
 - `docs/`: plans and feature notes
 
+## Scenario Docs
+
+De test retrieval, critique, current-page routing, va local-provider budget nhanh, dung bo tai lieu mau trong [docs/PHASE_3C_TEST_SCENARIOS.md](/Users/long.vo/workspaces/personal/side-projects/llm-extensions/docs/PHASE_3C_TEST_SCENARIOS.md).
+
+## Local LLM Guide
+
+Neu ban muon chay bang local LLM tren Mac, xem huong dan nhanh trong [QUICK_GUIDE.md](/Users/long.vo/workspaces/personal/side-projects/llm-extensions/QUICK_GUIDE.md).
+
+Neu can ban ngan hon de gui thang cho user noi bo, dung [QUICK_GUIDE_INTERNAL.md](/Users/long.vo/workspaces/personal/side-projects/llm-extensions/QUICK_GUIDE_INTERNAL.md).
+
+## Benchmarking
+
+Phase 3D co script benchmark nho de do `retrieval`, `generation`, `end-to-end`, va `TTFT` khi provider co expose timing metadata.
+
+```bash
+pnpm benchmark:phase3d
+```
+
+Tuy chon:
+
+```bash
+pnpm benchmark:phase3d -- --base-url http://127.0.0.1:8000 --runs 3
+```
+
+Script nay goi 3 endpoint:
+- `POST /api/rag-summarize`
+- `POST /api/critique`
+- `POST /api/generate-diagram`
+
+va in ra provider, model, budget policy, client latency, server end-to-end, retrieval, generation, va `ttft` neu co.
+
 ## Quick Start
 
 ### 1. Install frontend dependencies
@@ -61,6 +92,65 @@ LLM_PROVIDER=anthropic
 ANTHROPIC_API_KEY=your-key-here
 ```
 
+For local Ollama on a Mac host, use:
+
+```env
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL_SUMMARY=gemma2:2b
+OLLAMA_MODEL_REASONING=deepseek-coder-v2:16b-lite-instruct
+OLLAMA_REQUEST_TIMEOUT_SECONDS=45
+EMBEDDING_PROVIDER=local
+LOCAL_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+```
+
+If the backend runs in Docker, switch `OLLAMA_BASE_URL` to `http://host.docker.internal:11434`.
+
+Local-only mode phu hop khi:
+- ban muon PoC tren may ca nhan
+- ban chap nhan toc do cham hon cloud
+- ban muon chi phi LLM bang `0` trong diagnostics
+
+Truoc khi start backend, can dam bao Ollama dang chay tren may va da pull model:
+
+```bash
+ollama pull gemma2:2b
+ollama pull deepseek-coder-v2:16b-lite-instruct
+```
+
+For hybrid mode with local prefilter and cloud answer, use:
+
+```env
+LLM_PROVIDER=hybrid
+HYBRID_CLOUD_PROVIDER=openai
+AWS_GATEWAY_URL=https://genai-gateway.flava-cloud.com/v1
+PAT_TOKEN=your-internal-pat
+OPENAI_MODEL_SUMMARY=gpt-4o-mini
+OPENAI_MODEL_REASONING=o4-mini
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL_SUMMARY=gemma2:2b
+HYBRID_PREFILTER_MAX_CHUNKS=4
+EMBEDDING_PROVIDER=local
+LOCAL_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+```
+
+Hybrid mode phu hop khi:
+- ban muon giam token burn o cloud
+- ban van can cloud model cho summary/critique/diagram chat luong cao
+- ban muon local Ollama cat gon context truoc khi gui len cloud
+
+Trong hybrid mode:
+- `OLLAMA_MODEL_SUMMARY` dung cho local prefilter
+- cloud provider van la model tra loi cuoi
+- neu local prefilter fail hoac timeout, backend se fallback ve full retrieved context
+
+Optional model routing:
+- `OPENAI_MODEL_SUMMARY` / `OPENAI_MODEL_REASONING`
+- `ANTHROPIC_MODEL_SUMMARY` / `ANTHROPIC_MODEL_REASONING`
+- `OLLAMA_MODEL_SUMMARY` / `OLLAMA_MODEL_REASONING`
+
+If unset, the backend reuses one model for all tasks.
+
 For the internal gateway flow, use:
 
 ```env
@@ -68,6 +158,8 @@ LLM_PROVIDER=openai
 AWS_GATEWAY_URL=https://genai-gateway.flava-cloud.com/
 PAT_TOKEN=your-internal-pat
 OPENAI_MODEL=gpt-4o
+OPENAI_MODEL_SUMMARY=gpt-4o-mini
+OPENAI_MODEL_REASONING=o4-mini
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 REQUEST_TIMEOUT_SECONDS=120
 ```
@@ -80,6 +172,13 @@ source venv/bin/activate
 uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
+Neu dung local/hybrid mode, check nhanh:
+
+```bash
+curl http://127.0.0.1:8000/api/health
+node scripts/check-env.mjs backend/.env
+```
+
 ### 5. Run extension
 
 ```bash
@@ -87,6 +186,21 @@ pnpm dev
 ```
 
 Load the generated unpacked extension into Chrome from the Plasmo dev output.
+
+Sau khi load extension:
+1. mo sidepanel
+2. pin 1-3 page
+3. hoi `summarize only this page` hoac `critique this page only`
+4. mo `Technical Diagnostics`
+
+Neu dung local/hybrid mode, ban nen thay:
+- `Provider` / `Provider mode`
+- `Model`
+- `Budget policy`
+- `Retrieval time`
+- `Generation time`
+- `TTFT` neu provider co timing metadata
+- `Hybrid prefilter` neu dang o hybrid mode
 
 ## Docker
 
@@ -280,6 +394,7 @@ uvicorn main:app --reload --host 127.0.0.1 --port 8000
 
 - The extension defaults to `http://localhost:8000` if no frontend env override is provided.
 - The backend supports both standard `OPENAI_API_KEY` and internal `PAT_TOKEN + AWS_GATEWAY_URL` for OpenAI-compatible gateways.
+- The backend also supports `LLM_PROVIDER=ollama` for local Mac-hosted Ollama via `host.docker.internal:11434`.
 - The Docker backend image installs optional local embedding and reranker dependencies too, so `EMBEDDING_PROVIDER=local` works there as well.
 - `Clear Cache` in the UI also clears saved diagram cache.
 - Generated folders like `build/`, `.plasmo/`, and Python/TS caches should not be committed.

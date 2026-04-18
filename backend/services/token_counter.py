@@ -52,7 +52,10 @@ class TokenCounter:
         chunks_with_scores: List[tuple[Chunk, float]],
         reserve_tokens: int = 4096,
         max_chunks_per_page: int = 3,
-        page_chunk_caps: dict[str, int] | None = None
+        page_chunk_caps: dict[str, int] | None = None,
+        source_type_chunk_caps: dict[str, int] | None = None,
+        max_total_chunks: int | None = None,
+        max_input_tokens_override: int | None = None
     ) -> List[Chunk]:
         """
         Select chunks that fit within token budget
@@ -70,7 +73,11 @@ class TokenCounter:
             List of selected chunks within budget
         """
         # Calculate available budget for input
-        max_input = self.settings.max_input_tokens - reserve_tokens
+        max_input = (
+            max_input_tokens_override
+            if max_input_tokens_override is not None
+            else self.settings.max_input_tokens - reserve_tokens
+        )
 
         # Sort by similarity (descending)
         sorted_chunks = sorted(chunks_with_scores, key=lambda x: x[1], reverse=True)
@@ -78,21 +85,37 @@ class TokenCounter:
         selected_chunks = []
         total_tokens = 0
         page_chunk_counts: dict[str, int] = {}
+        source_type_counts: dict[str, int] = {}
         deferred_chunks: List[tuple[Chunk, float]] = []
 
         for chunk, score in sorted_chunks:
             chunk_tokens = self.count_text(chunk.text)
             page_url = chunk.metadata.page_url
+            source_type = chunk.metadata.source_type
             page_cap = max(1, page_chunk_caps.get(page_url, max_chunks_per_page)) if page_chunk_caps else max_chunks_per_page
+            source_type_cap = (
+                max(1, source_type_chunk_caps.get(source_type, len(sorted_chunks)))
+                if source_type_chunk_caps
+                else len(sorted_chunks)
+            )
 
             # Always include first chunk (most relevant)
             if len(selected_chunks) == 0:
                 selected_chunks.append(chunk)
                 total_tokens += chunk_tokens
                 page_chunk_counts[page_url] = 1
+                source_type_counts[source_type] = source_type_counts.get(source_type, 0) + 1
+                continue
+
+            if max_total_chunks is not None and len(selected_chunks) >= max_total_chunks:
+                deferred_chunks.append((chunk, score))
                 continue
 
             if page_chunk_counts.get(page_url, 0) >= 1:
+                deferred_chunks.append((chunk, score))
+                continue
+
+            if source_type_counts.get(source_type, 0) >= source_type_cap:
                 deferred_chunks.append((chunk, score))
                 continue
 
@@ -101,15 +124,28 @@ class TokenCounter:
                 selected_chunks.append(chunk)
                 total_tokens += chunk_tokens
                 page_chunk_counts[page_url] = page_chunk_counts.get(page_url, 0) + 1
+                source_type_counts[source_type] = source_type_counts.get(source_type, 0) + 1
             else:
                 deferred_chunks.append((chunk, score))
 
         for chunk, score in deferred_chunks:
             page_url = chunk.metadata.page_url
+            source_type = chunk.metadata.source_type
 
             page_cap = max(1, page_chunk_caps.get(page_url, max_chunks_per_page)) if page_chunk_caps else max_chunks_per_page
+            source_type_cap = (
+                max(1, source_type_chunk_caps.get(source_type, len(sorted_chunks)))
+                if source_type_chunk_caps
+                else len(sorted_chunks)
+            )
 
             if page_chunk_counts.get(page_url, 0) >= page_cap:
+                continue
+
+            if source_type_counts.get(source_type, 0) >= source_type_cap:
+                continue
+
+            if max_total_chunks is not None and len(selected_chunks) >= max_total_chunks:
                 continue
 
             chunk_tokens = self.count_text(chunk.text)
@@ -118,6 +154,7 @@ class TokenCounter:
                 selected_chunks.append(chunk)
                 total_tokens += chunk_tokens
                 page_chunk_counts[page_url] = page_chunk_counts.get(page_url, 0) + 1
+                source_type_counts[source_type] = source_type_counts.get(source_type, 0) + 1
 
         return selected_chunks
 
@@ -150,7 +187,12 @@ class TokenCounter:
         # GPT-4o: $2.50 / 1M input, $10.00 / 1M output
         # Claude 3.5 Sonnet: $3.00 / 1M input, $15.00 / 1M output
 
-        if self.settings.llm_provider == "openai":
+        cost_provider = self.settings.resolved_cloud_provider()
+
+        if cost_provider == "ollama":
+            input_cost_per_1m = 0.0
+            output_cost_per_1m = 0.0
+        elif cost_provider == "openai":
             input_cost_per_1m = 2.50
             output_cost_per_1m = 10.00
         else:  # anthropic
